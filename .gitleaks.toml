@@ -1,0 +1,54 @@
+# gitleaks configuration — extends the default ruleset and allowlists the
+# reviewed synthetic test fixtures and non-secret identifiers in this
+# repository. Every entry below was verified: none is a live credential.
+title = "StudioQuack Engine"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Reviewed synthetic test fixtures and non-secrets"
+regexTarget = "match"
+regexes = [
+  # Synthetic secret-store ids used by tests (sec_ + 24 sequential or repeated hex digits).
+  '''sec_(0123456789abcdef01234567|abcdef0123456789abcdef01|abcdefabcdefabcdefabcdef|f{24})''',
+  # Synthetic ingress keys used by EntitlementSnapshotStoreTest.
+  '''sqk_(test_[a-z0-9_]+|boot_restore_ordering)''',
+  # Hand-built JWT-shaped strings in redaction tests; payloads decode to {"sub":"secret"} / {"sub":"1234"}.
+  '''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOi(JzZWNyZXQ|IxMjM0)[A-Za-z0-9_\-\.]*''',
+  # Synthetic KEM credential fixture in DependencyStatusReporterTest.
+  '''sqikm1\.test-proof''',
+  # AWS documentation example access key asserted by RedactorTest and SecretsOffDiskTest.
+  '''AKIAIOSFODNN7EXAMPLE''',
+  # Synthetic truncated PEM literal asserted by RedactorTest.
+  '''-----BEGIN RSA PRIVATE KEY-----(?:\\n|\r?\n)MIIEuff\.\.\.(?:\\n|\r?\n)-----END RSA PRIVATE KEY-----''',
+  # Synthetic token and bearer literals asserted by RedactorTest and SecretsOffDiskTest.
+  '''(?:SQVM_LLM_JOB_TOKEN=)?abcdef123456xyz''',
+  '''(?:SQ_HELPER_BEARER=)?h_abcdef123456''',
+  '''abcdef1234567890(?:xyz|secrettoken)?''',
+  # Synthetic plaintext secret fixtures in secret-custody and redaction unit tests.
+  '''pl4intext-DB-secret-Zx9Q7bkTVX28''',
+  '''resolved-DB-secret-Kp7Qx2Lm''',
+  '''value-A-plaintext-x9q7''',
+  # Synthetic provider API key sentinels in AI model proxy and route tests.
+  '''sk-(?:SENTINEL-PROVIDER-KEY|should-never-appear)''',
+  # Synthetic mesh auth keys in network handshake unit tests.
+  '''mesh-auth-test-(?:123-xyz|secret-do-not-log)''',
+  # Synthetic enrollment bearers in custody, KEM, and known-answer tests.
+  '''sqb-test-bearer-(?:0123456789abcdef|reinstall-fedcba9876543210)''',
+  '''sqvm_(?:test_bearer_kat_0001|installer_bearer_for_d02)''',
+  # Sequential hex test key and RFC 5869 / SHA-256 known-answer test vectors.
+  '''0123456789abcdef0123456789abcdef''',
+  '''701ae10be6364725dffa44c88343e674c877f1448a626b9100037d910fb7e7a4''',
+  '''cBrhC-Y2RyXf-kTIg0PmdMh38USKYmuRAAN9kQ-356Q''',
+  '''3cb25f25faacd57a90434f64d0362f2a''',
+  '''2d2d0a90cf1a5a4c5db02d56ecc4c5bf''',
+  # Ed25519 SubjectPublicKeyInfo (SPKI) public verification keys (not private keys).
+  '''MCowBQYDK2VwAyEA(?:FlcGLgDzkqL9aaiBi6FZw1T3UdswnliXSZqZK9ytp4s|xFt556xIA9ImPY0X/T0bzFd6JrcmdZtdOcY\+OPjowHA)=''',
+  # Java type names in method signatures (e.g. `X509Certificate`) that the generic rule mistakes for values.
+  '''\bX509Certificate\b''',
+]
+paths = [
+  # Build output is git-ignored and never distributed as source.
+  '''^target/''',
+]

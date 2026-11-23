@@ -1,0 +1,341 @@
+StudioQuack Source-Available License
+Version 1.0
+SPDX-License-Identifier: LicenseRef-StudioQuack-SAL-1.0
+
+Copyright (c) 2026 StudioQuack, Inc. All rights reserved.
+
+IMPORTANT — READ CAREFULLY. The Software is made publicly visible in source
+form for transparency, evaluation, and security review only. It is NOT
+open-source software, it is not licensed under any license approved by the
+Open Source Initiative, and public visibility of the source code does not
+grant any right to use, copy, modify, or distribute it. By accessing,
+viewing, downloading, cloning, compiling, installing, or otherwise using the
+Software, you agree to be bound by this License. If you do not agree, you
+have no right to access or use the Software.
+
+
+1. Definitions
+
+1.1 "Licensor" means StudioQuack, Inc., a Delaware corporation.
+
+1.2 "Software" means the source code, object code, build definitions,
+    configuration, documentation, and other materials published in this
+    repository or distributed by Licensor under this License, in whole or in
+    part, in any version.
+
+1.3 "StudioQuack Platform" or "Platform" means the hosted
+    workflow-automation service operated by Licensor under the StudioQuack
+    name, including its control plane, web application, APIs, private
+    network, release and update channels, and related services.
+
+1.4 "Platform Terms" means the StudioQuack Terms of Use, Privacy Policy,
+    Data Processing Agreement, and any subscription or order agreement that
+    governs your StudioQuack account.
+
+1.5 "Official Build" means an unmodified binary of the Software that
+    Licensor compiled, signed, and distributed through its official
+    channels (the StudioQuack installer, the in-product update mechanism, or
+    a release channel designated by Licensor).
+
+1.6 "Unofficial Build" means any binary, container image, package, or
+    running instance of the Software, or of any portion of it, that is not
+    an Official Build — including one you compiled yourself from this
+    repository, whether or not you changed the source code.
+
+1.7 "Derivative Work" means any modification, translation, port,
+    adaptation, or extension of the Software, and any work that is based on,
+    derived from, or incorporates any portion of the Software.
+
+1.8 "Platform Use" means installing and running an Official Build, enrolled
+    with the Platform under a valid StudioQuack account, in accordance with
+    the Platform Terms.
+
+1.9 "Commercial Purpose" means any use intended for or directed toward
+    commercial advantage or monetary compensation, including selling,
+    licensing, renting, leasing, hosting, bundling, or providing the
+    Software or a Derivative Work as or within a product or service, and
+    providing paid services (including hosting, managed, consulting,
+    integration, or support services) that are based on the Software or a
+    Derivative Work. Platform Use is not a Commercial Purpose under this
+    License; it is governed by the Platform Terms.
+
+1.10 "Competing Product" means any product, service, or project — free or
+     paid, open source or proprietary, hosted or self-hosted — that offers
+     workflow-automation, integration, orchestration, or workflow-execution
+     capabilities that substitute for, or compete with, the Software or any
+     part of the StudioQuack Platform, including any alternative control
+     plane, and any execution daemon, agent, or runner that implements or
+     emulates the Software's protocols or interfaces.
+
+1.11 "You" means the individual or legal entity exercising rights under
+     this License, together with every entity that controls, is controlled
+     by, or is under common control with that entity.
+
+
+2. Limited License Grant
+
+Subject to your continuous compliance with this License, Licensor grants
+you a limited, revocable, non-exclusive, non-transferable,
+non-sublicensable, royalty-free, worldwide license, solely for
+non-commercial purposes, to:
+
+  (a) access, view, and read the source code of the Software in order to
+      evaluate it, review its security, audit its behavior, or understand
+      how an Official Build operates on systems you control ("Review
+      Purposes");
+
+  (b) make the copies, compilations, and temporary modifications that are
+      strictly necessary for Review Purposes, provided that every resulting
+      Unofficial Build is run only in an environment isolated from the
+      Platform, is never connected to the Platform, is not shared with any
+      third party, and is deleted when the review ends; and
+
+  (c) conduct good-faith security research in accordance with SECURITY.md.
+
+Platform Use is permitted only under, and is governed exclusively by, the
+Platform Terms. Nothing in this License restricts Platform Use that the
+Platform Terms permit, including use by your organization for its internal
+business operations.
+
+
+3. Restrictions
+
+Except as expressly permitted in Section 2, you shall not, and shall not
+permit, assist, or enable any third party to:
+
+  (a) use the Software or any Derivative Work for any Commercial Purpose;
+
+  (b) develop, offer, publish, distribute, host, operate, or make available
+      a Competing Product, or use the Software (including its source code,
+      architecture, protocols, interfaces, data formats, or documentation)
+      to design, develop, specify, or serve as a reference for a Competing
+      Product, including any purported "clean-room" reimplementation
+      prepared with knowledge of the Software;
+
+  (c) copy, distribute, publish, sublicense, sell, rent, lease, lend,
+      mirror, host for download, or otherwise make available the Software
+      or any Derivative Work to any third party, in source or object form,
+      by any means, including through package registries, container
+      registries, or public or private code repositories, except as
+      Section 4 describes;
+
+  (d) modify the Software or create Derivative Works, except temporary
+      modifications under Section 2(b) and 2(c);
+
+  (e) connect, enroll, register, authenticate, or otherwise integrate any
+      Unofficial Build or Derivative Work with the Platform (Section 5);
+
+  (f) remove, alter, obscure, or disable any copyright, license, trademark,
+      attribution, or other notice in the Software;
+
+  (g) circumvent, disable, or interfere with any license, entitlement,
+      enrollment, authentication, attestation, integrity-verification,
+      update, or security mechanism of the Software or the Platform;
+
+  (h) use the Software or any portion of it to train, fine-tune, or
+      evaluate any artificial-intelligence or machine-learning model, or
+      include it in any dataset; or
+
+  (i) use the Software in violation of applicable law, including the
+      export-control and sanctions laws referred to in Section 13.
+
+
+4. Forks on Source-Hosting Services
+
+Where the Software is published on a third-party source-hosting service,
+that service's terms may permit its users to view and fork public
+repositories within that service. Any such fork exists solely by operation
+of those terms; this License grants no additional right in it. A fork
+remains subject to this License in its entirety: it may not be modified,
+built, distributed, or used except as Section 2 permits, and it must retain
+this License and every notice in the Software unmodified.
+
+
+5. Platform Integrity — Official Builds Only
+
+5.1 Only Official Builds may connect to, enroll with, authenticate to,
+    exchange data with, or otherwise interoperate with the Platform.
+
+5.2 You shall not connect to the Platform any Unofficial Build, any
+    Derivative Work, or any software that emulates, imitates, or
+    reimplements the Software or its protocols, and you shall not use any
+    enrollment token, credential, key, or certificate issued for an
+    Official Build with any other software.
+
+5.3 Any connection prohibited by this Section is unauthorized, exceeds any
+    authorization granted by Licensor, and is a material breach of this
+    License and of the Platform Terms. Licensor may, without notice or
+    liability, detect, block, or quarantine the connection, revoke the
+    credentials involved, suspend or terminate the affected environments
+    and accounts, and pursue every remedy available at law or in equity.
+    You are liable for all damage, loss, and cost (including reasonable
+    attorneys' fees) that such a connection causes to Licensor, the
+    Platform, or other StudioQuack customers.
+
+5.4 Licensor may use technical measures, such as signature verification,
+    attestation, and integrity checks, to enforce this Section. The
+    presence, absence, or failure of any such measure does not limit this
+    Section.
+
+
+6. Feedback and Contributions
+
+Licensor does not accept unsolicited code contributions, and pull requests
+may be closed without review. If you nevertheless submit any suggestion,
+issue, code, or other material relating to the Software ("Feedback"), you
+grant Licensor a perpetual, irrevocable, worldwide, royalty-free, fully
+paid-up, transferable, and sublicensable license to use, reproduce, modify,
+distribute, and otherwise exploit that Feedback for any purpose, without
+attribution or compensation, and you represent that you have the right to
+grant that license. Feedback creates no obligation for Licensor.
+
+
+7. Ownership and Reservation of Rights
+
+The Software is licensed, not sold. Licensor and its licensors retain all
+right, title, and interest in and to the Software, including all
+intellectual-property rights. No right or license is granted by
+implication, estoppel, or otherwise, and all rights not expressly granted
+in this License are reserved by Licensor.
+
+Licensor grants you a license under its patent claims that are necessarily
+infringed by the Software, solely to the extent necessary to exercise the
+rights granted in Section 2. That patent license terminates immediately if
+you or your organization assert, in writing or in litigation, that the
+Software or the Platform infringes any patent.
+
+
+8. Trademarks
+
+"StudioQuack" and "Duckbot", together with the associated logos, product
+names, and trade dress (the "Marks"), are trademarks of Licensor. This
+License grants no right to use the Marks. You may refer to the Software or
+the Platform by name only in a truthful, nominative manner that does not
+suggest sponsorship, endorsement, or affiliation by Licensor. You shall not
+use the Marks, or any confusingly similar name or logo, in or as the name of
+any product, service, company, domain name, social-media account, package,
+repository, or fork, or in connection with any Unofficial Build, Derivative
+Work, or Competing Product. Use of the Marks is subject to applicable
+trademark law and to any trademark guidelines Licensor publishes.
+
+
+9. Third-Party Components
+
+Third-party components included in or used by the Software are licensed
+under their own licenses, which are identified in NOTICE.md and
+THIRD-PARTY.txt, reproduced in THIRD-PARTY-LICENSES.txt, and independent of
+this License. Nothing in this License restricts any right those licenses
+grant you in the components themselves — including, for components under
+the GNU Lesser General Public License, the right to modify and relink the
+component for your own use and to reverse engineer it to debug such
+modifications, and, for components under the GNU General Public License
+with the Classpath Exception, access to their corresponding source as
+described in NOTICE.md. Exercising those rights is not a breach of this
+License; whether a build so modified may connect to the Platform is governed
+by the Platform Terms. Sections 3 and 5 apply to the Software as a whole and
+not to any third-party component taken on its own.
+
+
+10. Term and Termination
+
+10.1 This License is effective until terminated. It terminates
+     automatically and immediately, without notice, if you breach any of
+     its terms.
+
+10.2 If your breach is your first breach of this License and is not a
+     breach of Section 3(a), 3(b), 3(e), or 5, your License is reinstated
+     if you cure the breach completely within thirty (30) days after
+     Licensor notifies you of it. Licensor may otherwise reinstate a
+     terminated License only in writing.
+
+10.3 Upon termination you shall immediately cease all use of the Software,
+     destroy all copies and Derivative Works in your possession or control
+     (including any fork you control, to the extent the hosting service
+     allows its deletion), and, at Licensor's request, certify that
+     destruction in writing.
+
+10.4 Termination of this License does not by itself terminate your
+     StudioQuack account; a breach of Section 5 is, however, also a breach
+     of the Platform Terms. Sections 3, 5, 6, 7, 8, and 10 through 15
+     survive termination.
+
+
+11. Remedies
+
+Any use of the Software outside the scope of this License is unlicensed and
+infringes Licensor's intellectual-property rights. You acknowledge that a
+breach of Sections 3, 4, 5, or 8 would cause Licensor irreparable harm for
+which monetary damages would be inadequate, and that Licensor is entitled
+to injunctive and other equitable relief, without posting a bond to the
+extent permitted by law, in addition to every other remedy available to it.
+
+
+12. Disclaimer of Warranty and Limitation of Liability
+
+12.1 TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS
+     PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OR CONDITION OF
+     ANY KIND, EXPRESS, IMPLIED, OR STATUTORY, INCLUDING ANY WARRANTY OF
+     MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, OR
+     NON-INFRINGEMENT. YOU BEAR THE ENTIRE RISK OF YOUR USE OF THE
+     SOFTWARE.
+
+12.2 TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT WILL
+     LICENSOR BE LIABLE TO YOU UNDER THIS LICENSE FOR ANY DIRECT, INDIRECT,
+     INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR
+     FOR ANY LOSS OF PROFITS, REVENUE, DATA, OR GOODWILL, ARISING OUT OF OR
+     RELATING TO THE SOFTWARE OR THIS LICENSE, UNDER ANY THEORY OF
+     LIABILITY, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+     Licensor's liability for Platform Use is governed solely by the
+     Platform Terms.
+
+
+13. Export Control and Sanctions
+
+The Software contains cryptographic functionality. You shall comply with
+all applicable export-control, import, and sanctions laws and regulations,
+including those of the United States, the European Union, the United
+Kingdom, and the country in which you access or use the Software. You
+represent that you are not located in, or a resident or national of, any
+country or region subject to comprehensive sanctions, and that you are not
+listed on, or owned or controlled by a party listed on, any government
+restricted-party list.
+
+
+14. Governing Law and Venue
+
+This License is governed by the laws of the State of Delaware, United
+States of America, without regard to its conflict-of-laws rules. The
+United Nations Convention on Contracts for the International Sale of Goods
+does not apply. The state and federal courts located in the State of
+Delaware have exclusive jurisdiction over any dispute arising out of or
+relating to this License or the Software, and you consent to their personal
+jurisdiction. Licensor may nevertheless seek injunctive or other equitable
+relief in any court of competent jurisdiction. Nothing in this Section
+limits mandatory consumer-protection rights that cannot be waived by
+agreement under the law of your place of residence.
+
+
+15. General
+
+15.1 Entire agreement. This License is the entire agreement between you and
+     Licensor concerning the Software. The Platform Terms govern Platform
+     Use; in the event of a conflict concerning Platform Use, the Platform
+     Terms prevail.
+
+15.2 Severability; waiver. If any provision of this License is held
+     unenforceable, it will be enforced to the maximum extent permissible
+     and the remaining provisions remain in full force. Failure to enforce
+     a provision is not a waiver of it.
+
+15.3 Assignment. You may not assign or transfer this License, by operation
+     of law or otherwise, without Licensor's prior written consent.
+     Licensor may assign this License without restriction.
+
+15.4 New versions. Licensor may publish new versions of this License. Each
+     release of the Software is governed by the version of this License
+     that accompanies it.
+
+15.5 Notices and requests. Legal notices, licensing requests, and requests
+     for rights not granted by this License:
+     StudioQuack, Inc., 1111b South Governors Ave, STE 37760, Dover, DE 19904,
+     United States — legal@studioquack.com.

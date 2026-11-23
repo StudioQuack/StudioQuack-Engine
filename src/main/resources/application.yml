@@ -1,0 +1,170 @@
+# StudioQuack Self-Hosted Engine production configuration.
+spring:
+  application:
+    name: sq-client-daemon
+  datasource:
+    # Encrypted file H2 database; the file cipher key is managed by the OS secret store.
+    url: jdbc:h2:async:${SQS_DATA_DIR:./data}/sqs-engine;CIPHER=AES;AUTO_SERVER=FALSE;DB_CLOSE_ON_EXIT=FALSE;MAX_COMPACT_TIME=10000
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ${SQS_H2_PASSWORD:}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+  activiti:
+    check-process-definitions: false
+    database-schema-update: true
+    async-executor-activate: true
+    history-level: full
+    db-history-used: true
+
+server:
+  # Loopback operations and helper API listener.
+  port: ${SQS_HTTP_PORT:9876}
+  address: ${SQS_HTTP_ADDRESS:127.0.0.1}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+sqs:
+  tier: base
+  # Control-plane base URL; HTTPS is required for non-loopback endpoints.
+  backend:
+    base-url: ${SQS_BE_BASE_URL:https://api.studioquack.com}
+  channel:
+    # Directory for channel credentials and mesh key material.
+    data-dir: ${SQS_DATA_DIR:./data}/channel
+    enroll-retry-minutes: ${SQS_CHANNEL_ENROLL_RETRY_MINUTES:360}
+    heartbeat:
+      wg-keepalive-seconds: ${SQS_HEARTBEAT_WG_KEEPALIVE_SECONDS:15}
+      fallback-start-seconds: ${SQS_HEARTBEAT_FALLBACK_START_SECONDS:15}
+      fallback-min-seconds: ${SQS_HEARTBEAT_FALLBACK_MIN_SECONDS:15}
+    net:
+      # Local mesh CLI and periodic connectivity watchdog settings.
+      cli-path: ${SQS_CHANNEL_NET_CLI_PATH:sq-net}
+      socket-path: ${SQS_CHANNEL_NET_SOCKET_PATH:}
+      interface-name: ${SQS_CHANNEL_NET_INTERFACE_NAME:sqnet0}
+      watchdog:
+        enabled: ${SQS_CHANNEL_NET_WATCHDOG_ENABLED:true}
+        interval-seconds: ${SQS_CHANNEL_NET_WATCHDOG_INTERVAL_SECONDS:15}
+  # Language dependency cache mounted into sandbox containers.
+  deps:
+    root: ${SQS_DEPS_DIR:${SQS_DATA_DIR:./data}/deps}
+    install-memory-mb: ${SQS_DEPS_INSTALL_MEMORY_MB:2048}
+    install-cpus: ${SQS_DEPS_INSTALL_CPUS:2}
+  # Client-side encrypted file store limits.
+  files:
+    max-bytes: ${SQS_FILES_MAX_BYTES:2147483648}
+    inline-threshold-bytes: ${SQS_FILES_INLINE_THRESHOLD_BYTES:1048576}
+  # Cleanup settings for ephemeral workflow deployments.
+  deployment:
+    ephemeral-reap:
+      enabled: ${SQS_EPHEMERAL_REAP_ENABLED:true}
+      grace-minutes: ${SQS_EPHEMERAL_REAP_GRACE_MINUTES:15}
+      interval-ms: ${SQS_EPHEMERAL_REAP_INTERVAL_MS:60000}
+      initial-delay-ms: ${SQS_EPHEMERAL_REAP_INITIAL_DELAY_MS:60000}
+  # OS secret store configuration for encryption keys and node secrets.
+  secrets:
+    os:
+      enabled: ${SQS_SECRETS_OS_ENABLED:true}
+      provider: ${SQS_SECRETS_OS_PROVIDER:auto}
+      service-prefix: ${SQS_SECRETS_OS_SERVICE_PREFIX:com.studioquack.sqs}
+      account: ${SQS_SECRETS_OS_ACCOUNT:default}
+      data-dir: ${SQS_DATA_DIR:./data}
+  # Sandbox container resource caps, DNS pins, and network egress rules.
+  sandbox:
+    dep-cache-root: ${SQS_DEPS_DIR:${SQS_DATA_DIR:./data}/deps}
+    max-cpus: ${SQS_SANDBOX_MAX_CPUS:1.0}
+    max-ram-mb: ${SQS_SANDBOX_MAX_RAM_MB:0}
+    pids-limit: ${SQS_SANDBOX_PIDS_LIMIT:1024}
+    default-wall-ms: ${SQS_SANDBOX_DEFAULT_WALL_MS:86400000}
+    edge-transform-wall-ms: ${SQS_EDGE_TRANSFORM_WALL_MS:30000}
+    isolation-tier: ${SQS_ISOLATION_TIER:auto}
+    isolation-enforce: ${SQS_ISOLATION_ENFORCE:false}
+    overlay-egress: ${SQS_OVERLAY_EGRESS:auto}
+    egress-proxy:
+      url: ${SQS_EGRESS_PROXY_URL:}
+      no-proxy: ${SQS_EGRESS_NO_PROXY:}
+    connect:
+      max-streams-per-job: ${SQS_CONNECT_MAX_STREAMS_PER_JOB:8}
+      connect-timeout-ms: ${SQS_CONNECT_TIMEOUT_MS:5000}
+      idle-timeout-seconds: ${SQS_CONNECT_IDLE_TIMEOUT_SECONDS:600}
+    dns:
+      servers: ${SQS_SANDBOX_DNS_SERVERS:9.9.9.9,1.1.1.1}
+    oci:
+      stateful-dispatch-parallelism: ${SQS_STATEFUL_DISPATCH_PARALLELISM:8}
+  # Overlay listener port for peer-to-peer workflow execution calls.
+  overlay:
+    execute-port: ${SQS_OVERLAY_EXECUTE_PORT:8443}
+  # Allowed images and resource limits for node test-build execution.
+  testbuild:
+    allowed-images: ${SQS_TESTBUILD_ALLOWED_IMAGES:sq-local/sq-builtin-node-library,sq-local/node-test-emulator}
+    build-wall-clock-seconds: ${SQS_TESTBUILD_BUILD_WALL_CLOCK_SECONDS:600}
+    max-run-timeout-seconds: ${SQS_TESTBUILD_MAX_RUN_TIMEOUT_SECONDS:600}
+    run-memory: ${SQS_TESTBUILD_RUN_MEMORY:512m}
+    run-cpus: ${SQS_TESTBUILD_RUN_CPUS:1.0}
+    max-log-chars: ${SQS_TESTBUILD_MAX_LOG_CHARS:20000}
+    max-concurrent: ${SQS_TESTBUILD_MAX_CONCURRENT:2}
+  activiti:
+    async-executor:
+      core-pool-size: 8
+      max-pool-size: 32
+    failed-job-retries: 0
+  # Durable wait-state registries and orphan run reconciliation.
+  dispatch-registry:
+    durable: true
+  sub-pi:
+    durable: true
+  orphan-sweeper:
+    enabled: true
+    interval-ms: 300000
+    stale-threshold-ms: 900000
+    retention-ms: 604800000
+  # Local history retention window and disk-watermark cleanup.
+  log-retention-days: ${SQS_LOG_RETENTION_DAYS:1}
+  log-retention-days-max: ${SQS_LOG_RETENTION_DAYS_MAX:30}
+  log-retention:
+    enabled: true
+    reported:
+      interval-ms: 300000
+    disk:
+      enabled: false
+      interval-ms: 300000
+      high-watermark-percent: 90
+      min-retention-hours: 24
+      path: ${SQS_DATA_DIR:.}
+  # Pauses new work when available disk space drops below stop-free-mb.
+  disk-guard:
+    enabled: ${SQS_DISK_GUARD_ENABLED:true}
+    stop-free-mb: ${SQS_DISK_GUARD_STOP_FREE_MB:2048}
+    resume-free-mb: ${SQS_DISK_GUARD_RESUME_FREE_MB:4096}
+    interval-ms: 60000
+  # Pauses execution when offline beyond offline-after or when quota is exhausted.
+  execution-halt:
+    enabled: ${SQS_EXECUTION_HALT_ENABLED:${sqs.channel.enabled:false}}
+    offline-after: ${SQS_EXECUTION_HALT_OFFLINE_AFTER:PT5M}
+    check-interval-ms: 15000
+  # Maintenance and lifecycle paths and limits.
+  maintenance:
+    log-dir: ${SQS_MAINT_LOG_DIR:}
+    restart-grace-millis: ${SQS_MAINT_RESTART_GRACE_MS:3000}
+    stop-grace-millis: ${SQS_MAINT_STOP_GRACE_MS:3000}
+
+logging:
+  logback:
+    rollingpolicy:
+      max-file-size: 10MB
+      max-history: 7
+      total-size-cap: 200MB
+  level:
+    com.studioquack.sqs: INFO
+    org.activiti: WARN
+    org.bouncycastle.jsse: WARN

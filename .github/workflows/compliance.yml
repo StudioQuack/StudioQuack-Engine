@@ -1,0 +1,49 @@
+name: Compliance
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compliance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install and run gitleaks v8.30.1
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION="8.30.1"
+          GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          TARBALL="/tmp/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$TARBALL" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$TARBALL" | sha256sum -c -
+          tar -xzf "$TARBALL" -C /tmp gitleaks
+          chmod +x /tmp/gitleaks
+          /tmp/gitleaks git --config .gitleaks.toml --redact --no-banner --exit-code 1 .
+
+  competitor-names:
+    name: No competitor names in shipped text
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Scan tracked files
+        run: |
+          set -euo pipefail
+          # Pattern is stored base64-encoded so the names never appear verbatim in the repo.
+          p="$(printf '%s' 'bjhufHphcGllcnxpbnRlZ3JvbWF0fG1ha2VcLmNvbXxhY3RpdmVwaWVjZXN8cGlwZWRyZWFt' | base64 -d)"
+          if git grep -n -i -E "$p"; then
+            echo "::error::competitor product names must not appear in shipped files"
+            exit 1
+          fi

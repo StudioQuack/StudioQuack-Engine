@@ -1,0 +1,23 @@
+target/
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+*.log
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+
+# Python bytecode from editing the in-sandbox helper templates; these are resources,
+# not modules, and a .pyc must never be baked into the bootJar.
+__pycache__/
+*.pyc
+
+# Local daemon runtime state (entitlement snapshots, channel data)
+data/
+
+# Internal agent/IDE configuration is not part of the public source tree
+.cursor/

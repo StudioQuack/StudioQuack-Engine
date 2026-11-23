@@ -1,0 +1,31 @@
+version: 2
+updates:
+  - package-ecosystem: "maven"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      bouncycastle:
+        patterns:
+          - "org.bouncycastle:*"
+      maven-plugins:
+        patterns:
+          - "org.apache.maven.plugins:*"
+    ignore:
+      # Spring Boot 4 breaks Activiti 9.0.0 compatibility; stay on 3.5.x until Activiti upgrades.
+      - dependency-name: "org.springframework.boot:spring-boot-starter-parent"
+        update-types: ["version-update:semver-major"]
+      # Bouncy Castle 1.84+ relocated org.bouncycastle.pqc.crypto.mlkem; upgrade together with control plane.
+      - dependency-name: "org.bouncycastle:*"
+        versions: [">=1.84"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 2
+    groups:
+      github-actions:
+        patterns:
+          - "*"

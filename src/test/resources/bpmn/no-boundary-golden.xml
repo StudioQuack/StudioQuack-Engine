@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn2:definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmn2="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:activiti="http://activiti.org/bpmn" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:omgdc="http://www.omg.org/spec/DD/20100524/DC" xmlns:omgdi="http://www.omg.org/spec/DD/20100524/DI" typeLanguage="http://www.w3.org/2001/XMLSchema" expressionLanguage="http://www.w3.org/1999/XPath" targetNamespace="http://studioquack.com/bpmn">
+  <bpmn2:process id="Process_wfGolden" name="Golden Flow" isExecutable="true">
+    <bpmn2:startEvent id="node_startN" name="startN">
+      <extensionElements>
+        <activiti:executionListener event="start" delegateExpression="${callActivityChildContextListener}"></activiti:executionListener>
+        <activiti:executionListener event="start" delegateExpression="${startContextPublishListener}"></activiti:executionListener>
+      </extensionElements>
+    </bpmn2:startEvent>
+    <bpmn2:serviceTask id="node_scriptN" name="scriptN" activiti:async="true" activiti:delegateExpression="${scriptDispatchDelegate}"></bpmn2:serviceTask>
+    <bpmn2:receiveTask id="wait_scriptN" name="scriptN (wait)"></bpmn2:receiveTask>
+    <bpmn2:serviceTask id="errgate_scriptN" name="scriptN (error gate)" activiti:delegateExpression="${sqErrorGateDelegate}"></bpmn2:serviceTask>
+    <bpmn2:sequenceFlow id="flow_scriptN_to_wait" sourceRef="node_scriptN" targetRef="wait_scriptN"></bpmn2:sequenceFlow>
+    <bpmn2:sequenceFlow id="flow_scriptN_wait_to_gate" sourceRef="wait_scriptN" targetRef="errgate_scriptN"></bpmn2:sequenceFlow>
+    <bpmn2:boundaryEvent id="err_scriptN" attachedToRef="errgate_scriptN">
+      <errorEventDefinition></errorEventDefinition>
+    </bpmn2:boundaryEvent>
+    <bpmn2:exclusiveGateway id="failroute_scriptN" name="failure route (hold or end)" default="flow_scriptN_err_to_end"></bpmn2:exclusiveGateway>
+    <bpmn2:sequenceFlow id="flow_scriptN_err_to_failroute" sourceRef="err_scriptN" targetRef="failroute_scriptN"></bpmn2:sequenceFlow>
+    <bpmn2:serviceTask id="hold_scriptN" name="scriptN (failed — awaiting repair)" activiti:async="true" activiti:delegateExpression="${sqFailureHoldDelegate}"></bpmn2:serviceTask>
+    <bpmn2:sequenceFlow id="flow_scriptN_err_to_hold" sourceRef="failroute_scriptN" targetRef="hold_scriptN">
+      <extensionElements>
+        <activiti:executionListener event="take" delegateExpression="${failureHoldSentinelListener}"></activiti:executionListener>
+      </extensionElements>
+      <conditionExpression xsi:type="tFormalExpression"><![CDATA[${sqFailureHoldPolicy.shouldHold(execution)}]]></conditionExpression>
+    </bpmn2:sequenceFlow>
+    <bpmn2:endEvent id="Event_SandboxErrorEnd" name="Sandbox error">
+      <extensionElements>
+        <activiti:executionListener event="start" delegateExpression="${sharedErrorEndSentinelListener}"></activiti:executionListener>
+        <activiti:executionListener event="end" delegateExpression="${callActivityChildFailureListener}"></activiti:executionListener>
+      </extensionElements>
+    </bpmn2:endEvent>
+    <bpmn2:sequenceFlow id="flow_scriptN_err_to_end" sourceRef="failroute_scriptN" targetRef="Event_SandboxErrorEnd"></bpmn2:sequenceFlow>
+    <bpmn2:sequenceFlow id="flow_scriptN_hold_to_retry" sourceRef="hold_scriptN" targetRef="node_scriptN"></bpmn2:sequenceFlow>
+    <bpmn2:exclusiveGateway id="node_gwN" name="gwN" default="flow_e_gwN_script2N"></bpmn2:exclusiveGateway>
+    <bpmn2:serviceTask id="node_script2N" name="script2N" activiti:async="true" activiti:delegateExpression="${scriptDispatchDelegate}"></bpmn2:serviceTask>
+    <bpmn2:receiveTask id="wait_script2N" name="script2N (wait)"></bpmn2:receiveTask>
+    <bpmn2:serviceTask id="errgate_script2N" name="script2N (error gate)" activiti:delegateExpression="${sqErrorGateDelegate}"></bpmn2:serviceTask>
+    <bpmn2:sequenceFlow id="flow_script2N_to_wait" sourceRef="node_script2N" targetRef="wait_script2N"></bpmn2:sequenceFlow>
+    <bpmn2:sequenceFlow id="flow_script2N_wait_to_gate" sourceRef="wait_script2N" targetRef="errgate_script2N"></bpmn2:sequenceFlow>
+    <bpmn2:boundaryEvent id="err_script2N" attachedToRef="errgate_script2N">
+      <errorEventDefinition></errorEventDefinition>
+    </bpmn2:boundaryEvent>
+    <bpmn2:exclusiveGateway id="failroute_script2N" name="failure route (hold or end)" default="flow_script2N_err_to_end"></bpmn2:exclusiveGateway>
+    <bpmn2:sequenceFlow id="flow_script2N_err_to_failroute" sourceRef="err_script2N" targetRef="failroute_script2N"></bpmn2:sequenceFlow>
+    <bpmn2:serviceTask id="hold_script2N" name="script2N (failed — awaiting repair)" activiti:async="true" activiti:delegateExpression="${sqFailureHoldDelegate}"></bpmn2:serviceTask>
+    <bpmn2:sequenceFlow id="flow_script2N_err_to_hold" sourceRef="failroute_script2N" targetRef="hold_script2N">
+      <extensionElements>
+        <activiti:executionListener event="take" delegateExpression="${failureHoldSentinelListener}"></activiti:executionListener>
+      </extensionElements>
+      <conditionExpression xsi:type="tFormalExpression"><![CDATA[${sqFailureHoldPolicy.shouldHold(execution)}]]></conditionExpression>
+    </bpmn2:sequenceFlow>
+    <bpmn2:sequenceFlow id="flow_script2N_err_to_end" sourceRef="failroute_script2N" targetRef="Event_SandboxErrorEnd"></bpmn2:sequenceFlow>
+    <bpmn2:sequenceFlow id="flow_script2N_hold_to_retry" sourceRef="hold_script2N" targetRef="node_script2N"></bpmn2:sequenceFlow>
+    <bpmn2:endEvent id="node_endN" name="endN">
+      <extensionElements>
+        <activiti:executionListener event="end" delegateExpression="${callActivityChildFailureListener}"></activiti:executionListener>
+      </extensionElements>
+    </bpmn2:endEvent>
+    <bpmn2:sequenceFlow id="flow_e_startN_scriptN" sourceRef="node_startN" targetRef="node_scriptN"></bpmn2:sequenceFlow>
+    <bpmn2:sequenceFlow id="flow_e_scriptN_gwN" sourceRef="errgate_scriptN" targetRef="node_gwN"></bpmn2:sequenceFlow>
+    <bpmn2:sequenceFlow id="flow_e_gwN_script2N" sourceRef="node_gwN" targetRef="node_script2N"></bpmn2:sequenceFlow>
+    <bpmn2:sequenceFlow id="flow_e_script2N_endN" sourceRef="errgate_script2N" targetRef="node_endN"></bpmn2:sequenceFlow>
+  </bpmn2:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_Process_wfGolden">
+    <bpmndi:BPMNPlane bpmnElement="Process_wfGolden" id="BPMNPlane_Process_wfGolden"></bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn2:definitions>

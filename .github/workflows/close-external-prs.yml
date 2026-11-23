@@ -1,0 +1,58 @@
+name: Close external pull requests
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close-external-pr:
+    name: Enforce read-only source-available policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close external pull request with notice
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const repoFullName = context.payload.repository?.full_name;
+            const allowedAssociations = new Set(['OWNER', 'MEMBER']);
+            const isSameRepoDependabot =
+              pr.user?.type === 'Bot' &&
+              pr.user?.login === 'dependabot[bot]' &&
+              pr.head?.repo?.full_name === repoFullName;
+
+            if (allowedAssociations.has(pr.author_association) || isSameRepoDependabot) {
+              core.info(`Allowing PR #${pr.number} from ${pr.user?.login} (${pr.author_association}).`);
+              return;
+            }
+
+            const body = [
+              'Thank you for your interest in **StudioQuack Engine**.',
+              '',
+              'This repository is published under the [StudioQuack Source-Available License 1.0](https://github.com/StudioQuack/StudioQuack-Engine/blob/main/LICENSE) for transparency, evaluation, and security review only, and **does not accept external pull requests** (LICENSE §6).',
+              '',
+              '- **Bug reports and general support:** support@studioquack.com',
+              '- **Security vulnerabilities:** security@studioquack.com (see [SECURITY.md](https://github.com/StudioQuack/StudioQuack-Engine/blob/main/SECURITY.md))',
+              '- **Licensing and legal inquiries:** legal@studioquack.com',
+              '',
+              'This pull request is being closed automatically without review.',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body,
+            });
+
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              state: 'closed',
+            });
