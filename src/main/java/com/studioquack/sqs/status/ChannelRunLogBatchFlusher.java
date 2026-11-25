@@ -20,28 +20,34 @@ import java.net.URLEncoder;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
  * {@link RunLogBatchFlusher} that POSTs a BATCH run's locally-buffered per-node rows to the
  * control plane in one (chunked) shot over the secure channel.
+ *
+ * <p>Chunks respect both {@link SandboxLogIngestLimits#MAX_BATCH_ROWS} and
+ * {@link SandboxLogIngestLimits#MAX_CHUNK_BYTES} so a hydrated flush stays under the
+ * control-plane 16 MiB reject. A single row that alone exceeds the byte budget is slimmed
+ * (IO hydration dropped, streams capped) before POST; a 413 oversize refusal is a hard failure
+ * (no retry).
  */
 @Slf4j
 @Component
 @ConditionalOnProperty(prefix = "sqs.channel", name = "enabled", havingValue = "true")
 public class ChannelRunLogBatchFlusher implements RunLogBatchFlusher {
 
-    /** Rows per POST — bounds the body so a many-node run cannot exceed the backend's JSON cap. */
-    static final int CHUNK_SIZE = 200;
+    /** Rows per POST — matches control-plane batch row cap. */
+    static final int CHUNK_SIZE = SandboxLogIngestLimits.MAX_BATCH_ROWS;
 
     /** Per-chunk POST budget: generous, because a chunk may carry multi-MB hydrated file bytes. */
     private static final Duration CHUNK_TIMEOUT = Duration.ofSeconds(60);
 
     /**
-     * Per-chunk attempts: the flush happens once at the terminal boundary, so a transient refusal (BE
-     * restart, overlay blip) must not cost the run its logs. Backoff sleeps between attempts; a hard
-     * refusal (e.g. 401 while an older backend runs) exhausts quickly and the rows stay local — the
-     * run is then withheld from the reported-purge sweep by the caller.
+     * Per-chunk attempts: the flush happens once at the terminal boundary, so a transient refusal
+     * (restart, overlay blip) must not cost the run its logs. Backoff sleeps between attempts; a
+     * hard refusal (413 oversize / quota) exhausts immediately and the rows stay local.
      */
     static final int MAX_CHUNK_ATTEMPTS = 3;
     private static final long[] RETRY_BACKOFF_MS = {1_000L, 3_000L};
@@ -94,8 +100,8 @@ public class ChannelRunLogBatchFlusher implements RunLogBatchFlusher {
         try {
             List<SandboxLogEntity> entities =
                     repository.findByWorkflowExecutionIdOrderByCdateAsc(workflowExecutionId);
-            // HYDRATE: this is the ONE shipment the backend persists (and spills to stored files for the
-            // Monitoring download). The on-demand run-logs pull stays REF_ONLY.
+            // HYDRATE: this is the ONE shipment the control plane persists (and spills to stored
+            // files for the Monitoring download). The on-demand run-logs pull stays REF_ONLY.
             List<SandboxLogWireRow> rows =
                     rowMapper.toWireRows(entities, SandboxLogRowMapper.FileMode.HYDRATE);
             if (rows.isEmpty()) {
@@ -104,9 +110,9 @@ public class ChannelRunLogBatchFlusher implements RunLogBatchFlusher {
                 return true;
             }
             // Sub-PI re-key (parity with ChannelSandboxLogCallback's STREAM path): a function-port
-            // child runs under a fresh id the BE never registered, so posting under it 404s
-            // (Error_RunNotFound) and the provider node's logs never land. Rows stay buffered under
-            // the child id locally; only the POST target moves to the top-level run.
+            // child runs under a fresh id the control plane never registered, so posting under it
+            // 404s (Error_RunNotFound) and the provider node's logs never land. Rows stay buffered
+            // under the child id locally; only the POST target moves to the top-level run.
             String reportRunId = resolveReportRunId(workflowExecutionId);
             String url = outboundBaseHolder.currentEnvironmentBase(props.environmentBase(backendBaseUrl))
                     + "/runs/" + URLEncoder.encode(reportRunId, StandardCharsets.UTF_8)
@@ -115,21 +121,20 @@ public class ChannelRunLogBatchFlusher implements RunLogBatchFlusher {
                 log.info("run-log-batch[channel]: run={} is a sub-PI child — posting {} row(s) under top-level run={}",
                         workflowExecutionId, rows.size(), reportRunId);
             }
-            int total = rows.size();
-            for (int from = 0; from < total; from += CHUNK_SIZE) {
-                int to = Math.min(from + CHUNK_SIZE, total);
-                if (!postChunk(url, reportRunId, rows.subList(from, to))) {
-                    // Do NOT log "flushed": the BE refused at least one chunk, so the local rows
-                    // are the only copy. Returning false withholds the run from the reported-purge
-                    // sweep (ReportedRunRegistry) — a refused flush must never destroy the logs.
-                    log.warn("run-log-batch[channel]: run={} NOT fully flushed ({} row(s) buffered) — "
-                            + "rows retained locally; run stays out of the reported-purge sweep",
-                            workflowExecutionId, total);
+            List<List<SandboxLogWireRow>> chunks = partitionByBudget(rows);
+            int chunkIndex = 0;
+            for (List<SandboxLogWireRow> chunk : chunks) {
+                chunkIndex++;
+                if (!postChunk(url, reportRunId, chunk)) {
+                    log.warn("run-log-batch[channel]: run={} NOT fully flushed ({} row(s) buffered, "
+                                    + "failed at chunk {}/{}) — rows retained locally; run stays out of "
+                                    + "the reported-purge sweep",
+                            workflowExecutionId, rows.size(), chunkIndex, chunks.size());
                     return false;
                 }
             }
             log.info("run-log-batch[channel] run={} flushed {} row(s) in {} chunk(s)",
-                    workflowExecutionId, total, (total + CHUNK_SIZE - 1) / CHUNK_SIZE);
+                    workflowExecutionId, rows.size(), chunks.size());
             return true;
         } catch (Exception ex) {
             // Best-effort: the terminal status still goes out; the rows remain in the local store.
@@ -140,7 +145,84 @@ public class ChannelRunLogBatchFlusher implements RunLogBatchFlusher {
     }
 
     /**
-     * Resolves the run id the BE actually registered (top-level) for {@code workflowExecutionId} —
+     * Packs rows into chunks that stay under both the row cap and the byte budget.
+     * A single oversize row is slimmed so the flush can still progress.
+     */
+    List<List<SandboxLogWireRow>> partitionByBudget(List<SandboxLogWireRow> rows) throws Exception {
+        List<List<SandboxLogWireRow>> chunks = new ArrayList<>();
+        List<SandboxLogWireRow> current = new ArrayList<>();
+        int currentBytes = 2; // []
+        for (SandboxLogWireRow raw : rows) {
+            SandboxLogWireRow row = fitRow(raw);
+            byte[] encoded = mapper.writeValueAsBytes(row);
+            int rowBytes = encoded.length + (current.isEmpty() ? 0 : 1); // comma
+            boolean overRows = current.size() >= CHUNK_SIZE;
+            boolean overBytes = !current.isEmpty()
+                    && currentBytes + rowBytes > SandboxLogIngestLimits.MAX_CHUNK_BYTES;
+            if (overRows || overBytes) {
+                chunks.add(current);
+                current = new ArrayList<>();
+                currentBytes = 2;
+                rowBytes = encoded.length;
+            }
+            current.add(row);
+            currentBytes += rowBytes;
+        }
+        if (!current.isEmpty()) {
+            chunks.add(current);
+        }
+        return chunks;
+    }
+
+    /**
+     * Ensures one wire row serializes under {@link SandboxLogIngestLimits#MAX_CHUNK_BYTES}.
+     * Drops hydrated IO first, then caps streams.
+     */
+    SandboxLogWireRow fitRow(SandboxLogWireRow row) throws Exception {
+        if (row == null) {
+            return null;
+        }
+        byte[] encoded = mapper.writeValueAsBytes(row);
+        if (encoded.length <= SandboxLogIngestLimits.MAX_CHUNK_BYTES) {
+            return row;
+        }
+        log.warn("run-log-batch[channel]: single row node={} bytes={} exceeds chunk budget — "
+                        + "dropping hydrated IO and capping streams",
+                row.nodeId(), encoded.length);
+        SandboxLogWireRow slim = new SandboxLogWireRow(
+                row.nodeId(), row.nodeName(), row.status(), row.exitCode(), row.durationMs(),
+                row.language(), row.containerId(),
+                capStream(row.stdout()), capStream(row.stderr()), capStream(row.errorMessage()),
+                null, null, null, row.unknownInputParameters(),
+                row.failureKind(), row.postureNote(), row.cdate(), row.logId(), row.retry());
+        encoded = mapper.writeValueAsBytes(slim);
+        if (encoded.length <= SandboxLogIngestLimits.MAX_CHUNK_BYTES) {
+            return slim;
+        }
+        log.error("run-log-batch[channel]: row node={} still {} bytes after slim — sending status stub",
+                row.nodeId(), encoded.length);
+        return new SandboxLogWireRow(
+                row.nodeId(), row.nodeName(), row.status(), row.exitCode(), row.durationMs(),
+                row.language(), row.containerId(),
+                "[omitted: exceeded sandbox-log ingest budget]", null,
+                row.errorMessage() == null ? null : capStream(row.errorMessage()),
+                null, null, null, null,
+                row.failureKind(), row.postureNote(), row.cdate(), row.logId(), row.retry());
+    }
+
+    private static String capStream(String s) {
+        if (s == null) {
+            return null;
+        }
+        int cap = Math.min(s.length(), 1024 * 1024);
+        if (cap == s.length()) {
+            return s;
+        }
+        return s.substring(0, cap) + "\n…[truncated by engine ingest budget]";
+    }
+
+    /**
+     * Resolves the run id the control plane registered (top-level) for {@code workflowExecutionId} —
      * a function-port sub-PI child maps to its outermost parent. Falls back to the raw id when the
      * registry is unavailable — best-effort, never blocks a flush.
      */
@@ -156,11 +238,22 @@ public class ChannelRunLogBatchFlusher implements RunLogBatchFlusher {
         return workflowExecutionId;
     }
 
-    /** POSTs one chunk with bounded retries. */
+    /**
+     * POSTs one chunk with bounded retries. Never throws.
+     *
+     * @return {@code true} only when the control plane acknowledged a chunk with 2xx.
+     */
     private boolean postChunk(String url, String workflowExecutionId, List<SandboxLogWireRow> chunk) {
         for (int attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
             try {
                 String body = mapper.writeValueAsString(chunk);
+                if (body.getBytes(StandardCharsets.UTF_8).length > SandboxLogIngestLimits.MAX_REQUEST_BYTES) {
+                    log.error("run-log-batch[channel]: local body {} bytes exceeds {} — refusing chunk "
+                                    + "(run={} rows={})",
+                            body.getBytes(StandardCharsets.UTF_8).length,
+                            SandboxLogIngestLimits.MAX_REQUEST_BYTES, workflowExecutionId, chunk.size());
+                    return false;
+                }
                 HttpResponse<String> resp = ChannelHttp.postJson(
                         httpClients.get(), url, props.getBearer(), body, CHUNK_TIMEOUT);
                 if (ChannelHttp.isOk(resp.statusCode())) {
@@ -169,8 +262,13 @@ public class ChannelRunLogBatchFlusher implements RunLogBatchFlusher {
                 log.warn("run-log-batch[channel]: BE {} for run={} chunkSize={} attempt={}/{} body={}",
                         resp.statusCode(), workflowExecutionId, chunk.size(), attempt, MAX_CHUNK_ATTEMPTS,
                         ChannelHttp.trim(resp.body()));
+                if (SandboxLogIngestLimits.isOversizeRefusal(resp.statusCode(), resp.body())) {
+                    log.error("run-log-batch[channel]: control plane rejected oversize log chunk run={} rows={} — "
+                                    + "engine must chunk under {} bytes",
+                            workflowExecutionId, chunk.size(), SandboxLogIngestLimits.MAX_REQUEST_BYTES);
+                    return false;
+                }
                 if (com.studioquack.sqs.engine.halt.ExecutionHaltGuard.isQuotaRefusal(resp.statusCode(), resp.body())) {
-                    // The allowance does not renew within the backoff — retrying only repeats the refusal.
                     if (executionHaltGuard != null) {
                         executionHaltGuard.observeLogRefusal(resp.statusCode(), resp.body());
                     }

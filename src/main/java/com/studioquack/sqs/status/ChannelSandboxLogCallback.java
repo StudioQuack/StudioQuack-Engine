@@ -110,19 +110,20 @@ public class ChannelSandboxLogCallback implements SandboxLogCallback {
             String url = outboundBaseHolder.currentEnvironmentBase(props.environmentBase(backendBaseUrl))
                     + "/runs/" + URLEncoder.encode(reportRunId, StandardCharsets.UTF_8)
                     + "/sandbox-logs";
-            // Hydrate sq-file: handles to inline base64 so the backend can store the file (inline when small,
-            // stored files-chunked past its own threshold) and Duck Tales can render the original port schema
-            // with a truncated data preview or a download. The daemon never converts to sq-ref:: itself — that
-            // is the backend's call.
+            // Hydrate sq-file: handles to inline base64 so the control plane can store the file
+            // (inline when small, stored-file chunked past its threshold). Body must stay under
+            // SandboxLogIngestLimits (16 MiB reject); slim if needed.
             Object hydratedInput = hydrate(record.input());
             Object hydratedOutput = hydrate(record.output());
-            String body = mapper.writeValueAsString(new Body(
-                    record.nodeId(), record.nodeName(), record.status(), record.exitCode(),
-                    record.durationMs(), record.language(), record.containerId(),
-                    record.stdout(), record.stderr(), record.errorMessage(),
-                    hydratedInput, hydratedOutput, record.appliedInputs(), record.unknownInputParameters(),
-                    record.failureKind(), record.postureNote(), record.logId(),
-                    Boolean.TRUE.equals(record.retry()) ? Boolean.TRUE : null));
+            String body = fitTerminalBody(record, hydratedInput, hydratedOutput);
+            if (body == null) {
+                dispatcher.markLossy(record.workflowExecutionId());
+                log.error("sandbox-log[channel]: refusing oversize terminal body run={} node={} "
+                                + "(exceeds {} bytes even after slim)",
+                        record.workflowExecutionId(), record.nodeId(),
+                        SandboxLogIngestLimits.MAX_REQUEST_BYTES);
+                return;
+            }
             HttpResponse<String> resp = ChannelHttp.postJson(
                     httpClients.get(), url, props.getBearer(), body, Duration.ofSeconds(60));
             if (!ChannelHttp.isOk(resp.statusCode())) {
@@ -130,6 +131,12 @@ public class ChannelSandboxLogCallback implements SandboxLogCallback {
                 dispatcher.markLossy(record.workflowExecutionId());
                 if (executionHaltGuard != null) {
                     executionHaltGuard.observeLogRefusal(resp.statusCode(), resp.body());
+                }
+                if (SandboxLogIngestLimits.isOversizeRefusal(resp.statusCode(), resp.body())) {
+                    log.error("sandbox-log[channel]: control plane 413 oversize for run={} node={} — "
+                                    + "engine must keep POST under {} bytes",
+                            record.workflowExecutionId(), record.nodeId(),
+                            SandboxLogIngestLimits.MAX_REQUEST_BYTES);
                 }
                 log.warn("sandbox-log[channel]: BE {} for workflowExecutionId={} reportAs={} node={} body={}",
                         resp.statusCode(), record.workflowExecutionId(), reportRunId, record.nodeId(),
@@ -218,6 +225,64 @@ public class ChannelSandboxLogCallback implements SandboxLogCallback {
             // fall through to the raw id
         }
         return workflowExecutionId;
+    }
+
+    /**
+     * Builds a terminal POST body under {@link SandboxLogIngestLimits#MAX_CHUNK_BYTES}.
+     * Drops hydrated IO first, then caps streams; returns {@code null} only when even a
+     * status stub would exceed the ingest reject ceiling.
+     */
+    private String fitTerminalBody(SandboxLogRecord record, Object hydratedInput, Object hydratedOutput)
+            throws Exception {
+        Body full = new Body(
+                record.nodeId(), record.nodeName(), record.status(), record.exitCode(),
+                record.durationMs(), record.language(), record.containerId(),
+                record.stdout(), record.stderr(), record.errorMessage(),
+                hydratedInput, hydratedOutput, record.appliedInputs(), record.unknownInputParameters(),
+                record.failureKind(), record.postureNote(), record.logId(),
+                Boolean.TRUE.equals(record.retry()) ? Boolean.TRUE : null);
+        String json = mapper.writeValueAsString(full);
+        if (json.getBytes(StandardCharsets.UTF_8).length <= SandboxLogIngestLimits.MAX_CHUNK_BYTES) {
+            return json;
+        }
+        log.warn("sandbox-log[channel]: terminal body run={} node={} over chunk budget — "
+                        + "dropping hydrated IO / capping streams",
+                record.workflowExecutionId(), record.nodeId());
+        Body slim = new Body(
+                record.nodeId(), record.nodeName(), record.status(), record.exitCode(),
+                record.durationMs(), record.language(), record.containerId(),
+                capStream(record.stdout()), capStream(record.stderr()), capStream(record.errorMessage()),
+                null, null, null, record.unknownInputParameters(),
+                record.failureKind(), record.postureNote(), record.logId(),
+                Boolean.TRUE.equals(record.retry()) ? Boolean.TRUE : null);
+        json = mapper.writeValueAsString(slim);
+        if (json.getBytes(StandardCharsets.UTF_8).length <= SandboxLogIngestLimits.MAX_CHUNK_BYTES) {
+            return json;
+        }
+        Body stub = new Body(
+                record.nodeId(), record.nodeName(), record.status(), record.exitCode(),
+                record.durationMs(), record.language(), record.containerId(),
+                "[omitted: exceeded sandbox-log ingest budget]", null,
+                capStream(record.errorMessage()),
+                null, null, null, null,
+                record.failureKind(), record.postureNote(), record.logId(),
+                Boolean.TRUE.equals(record.retry()) ? Boolean.TRUE : null);
+        json = mapper.writeValueAsString(stub);
+        if (json.getBytes(StandardCharsets.UTF_8).length > SandboxLogIngestLimits.MAX_REQUEST_BYTES) {
+            return null;
+        }
+        return json;
+    }
+
+    private static String capStream(String s) {
+        if (s == null) {
+            return null;
+        }
+        int cap = Math.min(s.length(), 1024 * 1024);
+        if (cap == s.length()) {
+            return s;
+        }
+        return s.substring(0, cap) + "\n…[truncated by engine ingest budget]";
     }
 
     /**

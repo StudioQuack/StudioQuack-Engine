@@ -10,6 +10,7 @@ import com.studioquack.sqs.status.log.SandboxLogEntity;
 import com.studioquack.sqs.status.log.SandboxLogFileHydrator;
 import com.studioquack.sqs.status.log.SandboxLogRepository;
 import com.studioquack.sqs.status.log.SandboxLogRowMapper;
+import com.studioquack.sqs.status.log.SandboxLogWireRow;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 
@@ -125,5 +126,22 @@ class ChannelRunLogBatchFlusherTest {
             assertThat(be.requests()).singleElement().satisfies(r ->
                     assertThat(r.path()).isEqualTo(ENV_BASE + "/runs/" + PARENT_RUN + "/sandbox-logs/batch"));
         }
+    }
+
+    @Test
+    void partitionByBudget_splitsWhenByteCapWouldBeExceeded() throws Exception {
+        SandboxLogRepository repo = mock(SandboxLogRepository.class);
+        SubProcessCompletionRegistry registry = mock(SubProcessCompletionRegistry.class);
+        ChannelRunLogBatchFlusher flusher = newFlusher(repo, registry, "http://127.0.0.1:1");
+
+        String fat = "x".repeat(SandboxLogIngestLimits.MAX_CHUNK_BYTES / 2 + 1024);
+        SandboxLogWireRow a = new SandboxLogWireRow(
+                "n1", "A", "COMPLETED", 0, 1L, "python", null,
+                fat, null, null, null, null, null, null, null, null, null, "slog_a", null);
+        SandboxLogWireRow b = new SandboxLogWireRow(
+                "n2", "B", "COMPLETED", 0, 1L, "python", null,
+                fat, null, null, null, null, null, null, null, null, null, "slog_b", null);
+
+        assertThat(flusher.partitionByBudget(List.of(a, b))).hasSize(2);
     }
 }
