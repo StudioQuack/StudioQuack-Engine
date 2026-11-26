@@ -17,6 +17,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -294,6 +295,30 @@ class HeartbeatClientTest {
             assertEquals(30_000L, cadence.nextDelayMs());
             assertEquals(HeartbeatCadence.Mode.FALLBACK_DECAY, cadence.mode());
         }
+    }
+
+    @Test
+    void beat_401_flags_unauthorized_and_backoff_caps_at_5_minutes() throws Exception {
+        try (MockBackend be = new MockBackend()) {
+            be.stubJson(HEARTBEAT_PATH, 401, "{\"errorCode\":\"Error_Unauthorized\"}");
+            HeartbeatClient client = new HeartbeatClient(
+                    base(be), BEARER, "0.0.1", "inst-1", 1L, 0L, 2_000L,
+                    new ChannelHttpClients(null), MAPPER, new DaemonCommandRegistry(List.of()),
+                    new DefaultHeartbeatResourceProvider(), null);
+
+            HeartbeatClient.HeartbeatException ex = assertThrows(
+                    HeartbeatClient.HeartbeatException.class, client::beat);
+            assertEquals(401, ex.statusCode());
+            assertTrue(ex.isUnauthorized());
+            assertFalse(ex.isEnvNotFound());
+        }
+
+        assertEquals(30_000L, HeartbeatClient.authErrorBackoffMs(1));
+        assertEquals(60_000L, HeartbeatClient.authErrorBackoffMs(2));
+        assertEquals(120_000L, HeartbeatClient.authErrorBackoffMs(3));
+        assertEquals(240_000L, HeartbeatClient.authErrorBackoffMs(4));
+        assertEquals(300_000L, HeartbeatClient.authErrorBackoffMs(5));
+        assertEquals(300_000L, HeartbeatClient.authErrorBackoffMs(10));
     }
 
     /**

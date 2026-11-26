@@ -108,7 +108,7 @@ public class ExecChannelClient {
         }
         if (!ChannelHttp.isOk(resp.statusCode())) {
             throw new ExecChannelException("exec-commands: status " + resp.statusCode()
-                    + " body=" + ChannelHttp.trim(resp.body()));
+                    + " body=" + ChannelHttp.trim(resp.body()), resp.statusCode());
         }
         PullResponse parsed = mapper.readValue(resp.body(), PullResponse.class);
         List<DispatchEvent> commands = parsed.commands() == null ? List.of() : parsed.commands();
@@ -242,7 +242,8 @@ public class ExecChannelClient {
             resolver.reportResponse(resp.statusCode());
         }
         if (!ChannelHttp.isOk(resp.statusCode())) {
-            throw new ExecChannelException("exec-channel SSE: status " + resp.statusCode());
+            throw new ExecChannelException("exec-channel SSE: status " + resp.statusCode(),
+                    resp.statusCode());
         }
         boolean gotWork = false;
         try (BufferedReader reader = new BufferedReader(
@@ -295,10 +296,34 @@ public class ExecChannelClient {
         }
     }
 
+    /** Transient error retry ladder: 2s → 4s → 8s → 16s → 30s (fast recovery, never a 1s flood). */
+    static final long TRANSIENT_ERROR_BASE_MS = 2_000L;
+    static final long TRANSIENT_ERROR_MAX_MS = 30_000L;
+    /**
+     * Auth/missing-env retry ladder: 30s → 60s → 120s → 240s → 300s (5 min ceiling).
+     * Prevents a deactivated or reinstalled daemon from hammering /exec-commands at 1 req/s
+     * while still self-healing if credentials recover.
+     */
+    static final long AUTH_ERROR_BASE_MS = 30_000L;
+    static final long AUTH_ERROR_MAX_MS = 300_000L;
+
+    static long transientErrorBackoffMs(int consecutiveErrors) {
+        int shift = Math.min(Math.max(consecutiveErrors - 1, 0), 4);
+        return Math.min(TRANSIENT_ERROR_BASE_MS << shift, TRANSIENT_ERROR_MAX_MS);
+    }
+
+    static long authErrorBackoffMs(int consecutiveAuthErrors) {
+        int shift = Math.min(Math.max(consecutiveAuthErrors - 1, 0), 4);
+        return Math.min(AUTH_ERROR_BASE_MS << shift, AUTH_ERROR_MAX_MS);
+    }
+
     private void runLoop() {
         // Poll cadence tiers after the SSE window closes (matches the Go tiers).
         long[] pollTierMs = {1_000L, 5_000L, 15_000L};
         int tier = -1; // 1 = SSE hot
+        int consecutiveTransientErrors = 0;
+        int consecutiveAuthErrors = 0;
+        boolean authFailureLogged = false;
         while (running.get()) {
             try {
                 boolean gotWork;
@@ -310,12 +335,36 @@ public class ExecChannelClient {
                         sleepQuietly(pollTierMs[Math.min(tier, pollTierMs.length - 1)]);
                     }
                 }
+                consecutiveTransientErrors = 0;
+                consecutiveAuthErrors = 0;
+                authFailureLogged = false;
                 tier = gotWork ? -1 : Math.min(tier + 1, pollTierMs.length - 1);
             } catch (Exception ex) {
                 if (running.get()) {
-                    log.debug("channel/exec: tier error: {}", ex.toString());
                     tier = Math.min(Math.max(tier, 0) + 1, pollTierMs.length - 1);
-                    sleepQuietly(1_000L);
+                    if (ex instanceof ExecChannelException ece
+                            && (ece.isUnauthorized() || ece.isEnvNotFound())) {
+                        consecutiveAuthErrors++;
+                        consecutiveTransientErrors = 0;
+                        long delayMs = authErrorBackoffMs(consecutiveAuthErrors);
+                        if (!authFailureLogged) {
+                            authFailureLogged = true;
+                            log.warn("channel/exec: control plane rejected this daemon's credential or environment "
+                                            + "({}) — backing off (next retry in {}s, ceiling {}s); if this engine "
+                                            + "was reinstalled or deactivated, stop or re-run the newest install command",
+                                    ece.getMessage(), delayMs / 1_000L, AUTH_ERROR_MAX_MS / 1_000L);
+                        } else {
+                            log.debug("channel/exec: auth/env error (backoff {}ms): {}", delayMs, ece.toString());
+                        }
+                        sleepQuietly(delayMs);
+                    } else {
+                        consecutiveTransientErrors++;
+                        consecutiveAuthErrors = 0;
+                        authFailureLogged = false;
+                        long delayMs = transientErrorBackoffMs(consecutiveTransientErrors);
+                        log.debug("channel/exec: tier error (backoff {}ms): {}", delayMs, ex.toString());
+                        sleepQuietly(delayMs);
+                    }
                 }
             }
         }
@@ -385,8 +434,27 @@ public class ExecChannelClient {
      * Raised on a non-success exec-channel status.
      */
     public static class ExecChannelException extends RuntimeException {
+        private final int statusCode;
+
         public ExecChannelException(String message) {
+            this(message, 0);
+        }
+
+        public ExecChannelException(String message, int statusCode) {
             super(message);
+            this.statusCode = statusCode;
+        }
+
+        public int statusCode() {
+            return statusCode;
+        }
+
+        public boolean isUnauthorized() {
+            return statusCode == 401;
+        }
+
+        public boolean isEnvNotFound() {
+            return statusCode == 404;
         }
     }
 }

@@ -29,6 +29,9 @@ public class NetWatchdog {
     private static final long PROBE_BUDGET_MS = 15_000L;
     private static final long PROBE_RETRY_DELAY_MS = 1_000L;
     private static final long MAX_BACKOFF_SECONDS = 60L;
+    /** Slower backoff after HTTP 401 so a deactivated daemon does not hammer /net/handshake. */
+    static final long AUTH_FAILURE_BASE_BACKOFF_SECONDS = 30L;
+    static final long AUTH_FAILURE_MAX_BACKOFF_SECONDS = 300L;
 
     private final SqsChannelProperties props;
 
@@ -38,6 +41,7 @@ public class NetWatchdog {
     private long intervalSeconds;
     private long nextAttemptNanos;
     private int consecutiveFailures;
+    private int consecutiveAuthFailures;
     private int attemptsThisOutage;
     private boolean downLogged;
     private final java.util.concurrent.atomic.AtomicBoolean forceAttempt =
@@ -176,6 +180,10 @@ public class NetWatchdog {
                     attemptsThisOutage, reason);
             resetOutageState();
         } catch (NetHandshakeException ex) {
+            if (ex.unauthorized()) {
+                failedUnauthorized(ex.getMessage());
+                return;
+            }
             if (ex.envNotFound()) {
                 failed(ex.getMessage());
                 return;
@@ -227,8 +235,31 @@ public class NetWatchdog {
         return false;
     }
 
+    static long authFailureBackoffSeconds(int consecutiveAuthFailures) {
+        int shift = Math.min(Math.max(consecutiveAuthFailures - 1, 0), 4);
+        return Math.min(AUTH_FAILURE_BASE_BACKOFF_SECONDS << shift, AUTH_FAILURE_MAX_BACKOFF_SECONDS);
+    }
+
+    private void failedUnauthorized(String reason) {
+        lastError = reason;
+        consecutiveAuthFailures++;
+        consecutiveFailures = 0;
+        long delaySeconds = authFailureBackoffSeconds(consecutiveAuthFailures);
+        if (consecutiveAuthFailures == 1) {
+            log.warn("channel/net/watchdog: control plane rejected this daemon's credential (HTTP 401) — "
+                            + "backing off (next retry in {}s, ceiling {}s); {}",
+                    delaySeconds, AUTH_FAILURE_MAX_BACKOFF_SECONDS, reason);
+            downLogged = true;
+        } else {
+            log.debug("channel/net/watchdog: handshake still unauthorized — {} (backoff {}s, attempt {})",
+                    reason, delaySeconds, attemptsThisOutage);
+        }
+        nextAttemptNanos = System.nanoTime() + delaySeconds * 1_000_000_000L;
+    }
+
     private void failed(String reason) {
         lastError = reason;
+        consecutiveAuthFailures = 0;
         consecutiveFailures++;
         if (!downLogged) {
             log.info("channel/net/watchdog: overlay DOWN — {} (attempt {})", reason, attemptsThisOutage);
@@ -243,6 +274,7 @@ public class NetWatchdog {
 
     private void resetOutageState() {
         consecutiveFailures = 0;
+        consecutiveAuthFailures = 0;
         attemptsThisOutage = 0;
         downLogged = false;
         nextAttemptNanos = 0L;

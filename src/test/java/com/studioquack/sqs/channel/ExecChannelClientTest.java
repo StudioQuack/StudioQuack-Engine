@@ -8,7 +8,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * {@link ExecChannelClient} against a mock server: asserts the EXACT {@code /exec-commands} poll
@@ -108,5 +111,46 @@ class ExecChannelClientTest {
             Map<?, ?> body = MAPPER.readValue(err.body(), Map.class);
             assertNotNull(body.get("error"), "error message included in the /error body");
         }
+    }
+
+    @Test
+    void poll_401_and_404_carry_http_status_and_backoff_caps_below_burst_threshold() throws Exception {
+        try (MockBackend be = new MockBackend()) {
+            String path = "/be/v1/sqvm/environments/" + ENV_ID + "/exec-commands";
+            be.stubJson(path, 401, "{\"errorCode\":\"Error_Unauthorized\"}");
+            ExecChannelClient client = new ExecChannelClient(
+                    base(be), BEARER, "inst-1", new ChannelHttpClients(null), MAPPER, null,
+                    900_000L, 15_000L, 600_000L);
+
+            ExecChannelClient.ExecChannelException unauth = assertThrows(
+                    ExecChannelClient.ExecChannelException.class,
+                    () -> client.pollAndDispatchOnce(32, 0L));
+            assertEquals(401, unauth.statusCode());
+            assertTrue(unauth.isUnauthorized());
+            assertFalse(unauth.isEnvNotFound());
+
+            be.stubJson(path, 404, "{\"errorCode\":\"Error_EnvNotFound\"}");
+            ExecChannelClient.ExecChannelException notFound = assertThrows(
+                    ExecChannelClient.ExecChannelException.class,
+                    () -> client.pollAndDispatchOnce(32, 0L));
+            assertEquals(404, notFound.statusCode());
+            assertTrue(notFound.isEnvNotFound());
+            assertFalse(notFound.isUnauthorized());
+        }
+
+        // Auth failure ladder: 30s -> 60s -> 120s -> 240s -> 300s cap (<=4 failures in 5m).
+        assertEquals(30_000L, ExecChannelClient.authErrorBackoffMs(1));
+        assertEquals(60_000L, ExecChannelClient.authErrorBackoffMs(2));
+        assertEquals(120_000L, ExecChannelClient.authErrorBackoffMs(3));
+        assertEquals(240_000L, ExecChannelClient.authErrorBackoffMs(4));
+        assertEquals(300_000L, ExecChannelClient.authErrorBackoffMs(5));
+        assertEquals(300_000L, ExecChannelClient.authErrorBackoffMs(10));
+
+        // Transient error ladder: 2s -> 4s -> 8s -> 16s -> 30s cap.
+        assertEquals(2_000L, ExecChannelClient.transientErrorBackoffMs(1));
+        assertEquals(4_000L, ExecChannelClient.transientErrorBackoffMs(2));
+        assertEquals(8_000L, ExecChannelClient.transientErrorBackoffMs(3));
+        assertEquals(16_000L, ExecChannelClient.transientErrorBackoffMs(4));
+        assertEquals(30_000L, ExecChannelClient.transientErrorBackoffMs(5));
     }
 }

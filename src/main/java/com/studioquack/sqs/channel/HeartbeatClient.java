@@ -394,9 +394,22 @@ public class HeartbeatClient {
      */
     private static final long LONG_POLL_REOPEN_MS = 250L;
 
+    /**
+     * Backoff ladder after HTTP 401 (rejected/deactivated credential): 30s → 60s → 120s → 240s → 300s.
+     * Transient 5xx / transport outages keep the cadence's fast 15s cap for quick recovery.
+     */
+    static final long AUTH_ERROR_BASE_MS = 30_000L;
+    static final long AUTH_ERROR_MAX_MS = 300_000L;
+
+    static long authErrorBackoffMs(int consecutiveAuthFailures) {
+        int shift = Math.min(Math.max(consecutiveAuthFailures - 1, 0), 4);
+        return Math.min(AUTH_ERROR_BASE_MS << shift, AUTH_ERROR_MAX_MS);
+    }
+
     private void runLoop() {
 
         sleepQuietly(1_000L);
+        int consecutiveAuthFailures = 0;
         while (running.get()) {
             long next;
             try {
@@ -415,6 +428,7 @@ public class HeartbeatClient {
                 }
                 boolean longPolling = cadence.beginBeat() > 0;
                 beat();
+                consecutiveAuthFailures = 0;
                 next = cadence.nextDelayMs();
                 if (!pendingResults.isEmpty()) {
                     next = Math.min(next, RESULT_REOPEN_MS);
@@ -452,7 +466,25 @@ public class HeartbeatClient {
                     // exactly what beatNow asked for. The throw already cleared the interrupt
                     // status, so the next send is unaffected.
                     next = 0;
+                } else if (ex instanceof HeartbeatException he && he.isUnauthorized()) {
+                    consecutiveAuthFailures++;
+                    next = authErrorBackoffMs(consecutiveAuthFailures);
+                    if (running.get()) {
+                        if (consecutiveAuthFailures == 1) {
+                            log.warn("channel/heartbeat: control plane rejected this daemon's credential "
+                                            + "(HTTP 401) — backing off (next retry in {}s, ceiling {}s); if this "
+                                            + "engine was reinstalled or deactivated, stop or re-run the newest "
+                                            + "install command",
+                                    next / 1_000L, AUTH_ERROR_MAX_MS / 1_000L);
+                        } else {
+                            log.debug("channel/heartbeat: beat unauthorized (backoff {}ms): {}",
+                                    next, he.toString());
+                        }
+                    }
+                    // Clear any stale true confirmation so a rejected daemon never re-enters keepalive.
+                    cadence.noteOverlayReachable(null);
                 } else {
+                    consecutiveAuthFailures = 0;
                     if (running.get()) {
                         log.warn("channel/heartbeat: beat failed: {}", ex.toString());
                     }
@@ -562,6 +594,10 @@ public class HeartbeatClient {
 
         public int statusCode() {
             return statusCode;
+        }
+
+        public boolean isUnauthorized() {
+            return statusCode == 401;
         }
 
         /**

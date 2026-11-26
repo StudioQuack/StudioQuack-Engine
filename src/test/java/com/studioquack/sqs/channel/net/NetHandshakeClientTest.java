@@ -305,6 +305,30 @@ class NetHandshakeClientTest {
         }
     }
 
+    @Test
+    void handshake_401_flagsUnauthorized_and_watchdogBackoffCapsAt5Minutes(@TempDir Path dataDir)
+            throws Exception {
+        ListenerKeyStore keys = ListenerKeyStore.loadOrCreate(dataDir, ENV_ID, null);
+        try (MockBackend be = new MockBackend()) {
+            String envBase = be.baseUrl() + "/be/v1/sqvm/environments/" + ENV_ID;
+            be.stub(envBase.replace(be.baseUrl(), "") + NetHandshakeClient.PATH, req ->
+                    MockBackend.Response.json(401, "{\"errorCode\":\"Error_BearerMismatch\"}"));
+            NetHandshakeClient client = newClient(envBase, null, keys);
+
+            NetHandshakeException ex = assertThrows(NetHandshakeException.class, client::handshake);
+            assertEquals(401, ex.status());
+            assertTrue(ex.unauthorized());
+            assertFalse(ex.envNotFound());
+        }
+
+        assertEquals(30L, NetWatchdog.authFailureBackoffSeconds(1));
+        assertEquals(60L, NetWatchdog.authFailureBackoffSeconds(2));
+        assertEquals(120L, NetWatchdog.authFailureBackoffSeconds(3));
+        assertEquals(240L, NetWatchdog.authFailureBackoffSeconds(4));
+        assertEquals(300L, NetWatchdog.authFailureBackoffSeconds(5));
+        assertEquals(300L, NetWatchdog.authFailureBackoffSeconds(10));
+    }
+
     private static NetHandshakeClient newClient(String envBase, NetAgentClient agent,
                                                 ListenerKeyStore keys) {
         OverlayPeerDirectory overlay = new OverlayPeerDirectory();

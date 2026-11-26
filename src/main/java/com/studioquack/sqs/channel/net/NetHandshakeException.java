@@ -44,4 +44,8 @@ public class NetHandshakeException extends RuntimeException {
     public boolean noCellCapacity() {
         return status == 409 || ERROR_NO_CELL_CAPACITY.equals(errorCode);
     }
+
+    public boolean unauthorized() {
+        return status == 401;
+    }
 }
