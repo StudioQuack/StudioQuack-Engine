@@ -107,14 +107,11 @@ public class H2LogRetentionService implements ExecutionHistoryPurgeService {
         if (from == null) {
             purgeOrphanedLogRuns(to, totals, progress);
             purgeNullRunIdLogs(to, totals);
+            purgeOrphanedRunFiles(to);
         }
 
         if (from == null && activitiHistoryRetentionRepository != null) {
-            long orphanAct = purgeOrphanedActivitiHistory(to);
-            totals.activitiRows += orphanAct;
-            if (orphanAct > 0L) {
-                notifyProgress(progress, totals);
-            }
+            purgeOrphanedActivitiHistory(to, totals, progress);
         }
 
         log.info("log-delete[h2 range=[{},{}]]: purged {} execution_context + {} sandbox_log + {} ACT_HI_PROCINST "
@@ -249,8 +246,47 @@ public class H2LogRetentionService implements ExecutionHistoryPurgeService {
         return new BatchCounts(execDeleted, sandboxDeleted, activitiDeleted);
     }
 
-    private long purgeOrphanedActivitiHistory(Instant olderThan) {
-        long totalDeleted = 0L;
+    private void purgeOrphanedRunFiles(Instant olderThan) {
+        Timestamp cutoff = Timestamp.from(olderThan);
+        String cursor = null;
+        for (int pass = 0; pass < 500; pass++) {
+            List<String> ids;
+            try {
+                if (cursor == null) {
+                    ids = jdbcTemplate.queryForList(
+                            "SELECT cf.id FROM client_file cf "
+                                    + "WHERE cf.scope = ? AND cf.created_at < ? "
+                                    + "AND NOT EXISTS (SELECT 1 FROM ACT_RU_EXECUTION ru WHERE ru.BUSINESS_KEY_ = cf.scope_key) "
+                                    + "ORDER BY cf.id ASC LIMIT ?",
+                            String.class, ClientFileStore.SCOPE_RUN, cutoff, 500);
+                } else {
+                    ids = jdbcTemplate.queryForList(
+                            "SELECT cf.id FROM client_file cf "
+                                    + "WHERE cf.scope = ? AND cf.created_at < ? AND cf.id > ? "
+                                    + "AND NOT EXISTS (SELECT 1 FROM ACT_RU_EXECUTION ru WHERE ru.BUSINESS_KEY_ = cf.scope_key) "
+                                    + "ORDER BY cf.id ASC LIMIT ?",
+                            String.class, ClientFileStore.SCOPE_RUN, cutoff, cursor, 500);
+                }
+            } catch (RuntimeException ex) {
+                log.debug("log-delete[h2]: orphaned client_file lookup skipped: {}", ex.getMessage());
+                break;
+            }
+            if (ids == null || ids.isEmpty()) {
+                break;
+            }
+            cursor = ids.get(ids.size() - 1);
+            List<String> batch = ids;
+            executeInBatchTransaction(() -> {
+                String marks = String.join(", ", java.util.Collections.nCopies(batch.size(), "?"));
+                return jdbcTemplate.update("DELETE FROM client_file WHERE id IN (" + marks + ")", batch.toArray());
+            });
+            if (ids.size() < 500) {
+                break;
+            }
+        }
+    }
+
+    private void purgeOrphanedActivitiHistory(Instant olderThan, Totals totals, ProgressListener progress) {
         Timestamp cutoffTs = Timestamp.from(olderThan);
         for (int pass = 0; pass < 500; pass++) {
             List<String> orphanKeys;
@@ -265,12 +301,14 @@ public class H2LogRetentionService implements ExecutionHistoryPurgeService {
             }
             List<String> batch = orphanKeys;
             long deleted = executeInBatchTransaction(() -> purgeActivitiHistory(batch));
-            totalDeleted += deleted;
+            totals.activitiRows += deleted;
+            if (deleted > 0L) {
+                notifyProgress(progress, totals);
+            }
             if (deleted == 0L || orphanKeys.size() < DELETE_BATCH) {
                 break;
             }
         }
-        return totalDeleted;
     }
 
     private <T> T executeInBatchTransaction(java.util.function.Supplier<T> work) {

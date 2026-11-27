@@ -40,30 +40,40 @@ public interface ExecutionHistoryPurgeService {
         return new PurgeResult(0, 0, 0, 0);
     }
 
-    /** Callback notified after each committed batch with cumulative totals so far. */
+    /** Callback notified after each committed batch and stage transition with cumulative totals. */
     @FunctionalInterface
     interface ProgressListener {
         void onBatchCommitted(long rowsDeleted, long runsAffected, long sandboxLogRowsDeleted, long activitiRowsDeleted);
+
+        default void onStageChanged(String stage) {
+        }
     }
 
     /**
      * Outcome of a purge pass — serialised verbatim into the command result.
      *
      * @param rowsDeleted          total {@code execution_context} rows hard-deleted
-     * @param runsAffected         distinct terminated-and-aged runs whose rows were purged
-     * @param sandboxLogRowsDeleted total {@code sandbox_log} rows hard-deleted for the same runs
+     * @param runsAffected         distinct runs whose rows were purged
+     * @param sandboxLogRowsDeleted total {@code sandbox_log} rows hard-deleted
      * @param activitiRowsDeleted  total {@code ACT_HI_PROCINST} rows hard-deleted (children cascade)
+     * @param freedBytes           database bytes reclaimed back to the OS (via VACUUM FULL on Postgres)
      */
-    record PurgeResult(long rowsDeleted, long runsAffected, long sandboxLogRowsDeleted, long activitiRowsDeleted) {
+    record PurgeResult(long rowsDeleted, long runsAffected, long sandboxLogRowsDeleted,
+                       long activitiRowsDeleted, long freedBytes) {
 
         /** Backward-compatible 2-arg shape. */
         public PurgeResult(long rowsDeleted, long runsAffected) {
-            this(rowsDeleted, runsAffected, 0L, 0L);
+            this(rowsDeleted, runsAffected, 0L, 0L, 0L);
         }
 
         /** Backward-compatible 3-arg shape. */
         public PurgeResult(long rowsDeleted, long runsAffected, long sandboxLogRowsDeleted) {
-            this(rowsDeleted, runsAffected, sandboxLogRowsDeleted, 0L);
+            this(rowsDeleted, runsAffected, sandboxLogRowsDeleted, 0L, 0L);
+        }
+
+        /** Backward-compatible 4-arg shape. */
+        public PurgeResult(long rowsDeleted, long runsAffected, long sandboxLogRowsDeleted, long activitiRowsDeleted) {
+            this(rowsDeleted, runsAffected, sandboxLogRowsDeleted, activitiRowsDeleted, 0L);
         }
     }
 }
