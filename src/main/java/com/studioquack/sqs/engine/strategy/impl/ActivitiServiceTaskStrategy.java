@@ -31,6 +31,11 @@ public class ActivitiServiceTaskStrategy implements ActivitiFlowNodeStrategy {
 
     private final ActivitiBpmnElementHelper helper;
 
+    /** Exposes the shared element helper for parameter-driven compound expansions. */
+    public ActivitiBpmnElementHelper elementHelper() {
+        return helper;
+    }
+
     @Override
     public boolean supports(String bpmnType) {
         return true; // fallback for every unmatched bpmnType

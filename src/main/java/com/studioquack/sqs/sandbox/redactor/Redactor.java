@@ -33,6 +33,7 @@ public class Redactor {
                     "eyJ[A-Za-z0-9_\\-]+\\.eyJ[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+", "[redacted-jwt]"),
             RedactionPattern.of("aws-key", "AKIA[0-9A-Z]{16}", "[redacted-aws-key]"),
             RedactionPattern.of("gcp-key", "AIza[0-9A-Za-z\\-_]{35}", "[redacted-gcp-key]"),
+            RedactionPattern.of("webhook-key", "sqwh_[A-Za-z0-9_\\-]+", "[redacted-webhook-key]"),
             RedactionPattern.of("bearer-token",
                     "(?i)bearer\\s+[A-Za-z0-9._\\-]{12,}", "Bearer [redacted-token]"),
             RedactionPattern.of("llm-job-token",

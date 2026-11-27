@@ -62,7 +62,8 @@ public class DaemonCommandRegistry {
      * since it is the only path that re-establishes the overlay the blocked lane depends on.
      */
     public static final Set<String> IMMEDIATE_LANE_TYPES = Set.of(
-            "restart", "net-reconnect", "vm-reset", "update-daemon", "update-preview");
+            "restart", "net-reconnect", "vm-reset", "update-daemon", "update-preview",
+            "ingest-webhook-key-event");
 
     /**
      * True when {@code type} must run on the immediate lane (see {@link #IMMEDIATE_LANE_TYPES}).

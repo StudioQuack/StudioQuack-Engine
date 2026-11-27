@@ -2,19 +2,23 @@ package com.studioquack.common.dto.flow;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.studioquack.common.dto.webhook.WebhookKeyRefHelper;
 import org.junit.jupiter.api.Test;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Designer → → deploy contract for {@link BoundaryEventConfig}: blank errorCode is a catch-all,
- * message correlationKey is optional, and type-specific keys survive Jackson whether they arrive
- * nested under {@code config} or flattened beside id/type.
+ * Designer → deploy contract for {@link BoundaryEventConfig}: blank errorCode is a catch-all,
+ * message correlationKey is optional, type-specific keys survive Jackson whether they arrive
+ * nested under {@code config} or flattened beside id/type, and {@code INGRESS_NODE} message
+ * boundaries validate {@code ingressNodeBinding.templateId} + bound {@code $webhookKeyRef}.
  */
 class BoundaryEventConfigTest {
 
@@ -53,6 +57,8 @@ class BoundaryEventConfigTest {
         BoundaryEventConfig missing = BoundaryEventConfig.message("paymentReceived", null);
         missing.setId("boundary-message-a");
         assertTrue(missing.validate().isValid());
+        assertEquals(BoundaryEventConfig.MESSAGE_SOURCE_GENERIC, missing.getMessageSource());
+        assertFalse(missing.isIngressNodeSource());
 
         BoundaryEventConfig blank = BoundaryEventConfig.message("paymentReceived", "");
         blank.setId("boundary-message-blank");
@@ -151,6 +157,57 @@ class BoundaryEventConfigTest {
         assertEquals("duration", configs.get(1).get("config").get("timerType").asText());
         assertEquals("PT5M", configs.get(1).get("config").get("timerValue").asText());
         assertEquals("be_err", edges.get(0).get("data").get("boundaryEventId").asText());
+    }
+
+    @Test
+    void ingressNodeMessageBoundary_validatesTemplateAndWebhookKeyRef() {
+        BoundaryEventConfig cfg = new BoundaryEventConfig();
+        cfg.setId("boundary_hook_cancel");
+        cfg.setType(BoundaryEventConfig.BoundaryEventType.MESSAGE);
+        cfg.putConfig(BoundaryEventConfig.CONFIG_MESSAGE_SOURCE, BoundaryEventConfig.MESSAGE_SOURCE_INGRESS_NODE);
+
+        assertTrue(cfg.isIngressNodeSource());
+        assertFalse(cfg.validate().isValid(), "missing ingressNodeBinding must fail");
+
+        Map<String, Object> binding = new LinkedHashMap<>();
+        binding.put("templateId", "tpl-123");
+        cfg.putConfig(BoundaryEventConfig.CONFIG_INGRESS_NODE_BINDING, binding);
+        assertFalse(cfg.validate().isValid(), "missing $webhookKeyRef must fail");
+
+        binding.put("configurationParameters", List.of(
+                Map.of("shortCode", "operation", "value", "listen"),
+                Map.of("shortCode", "webhook_key", "value", WebhookKeyRefHelper.placeholder("whk_0123456789abcdef01234567"))));
+        assertTrue(cfg.validate().isValid(), "complete ingress binding must validate even without explicit messageName");
+        assertNotNull(cfg.getIngressNodeBinding());
+    }
+
+    @Test
+    void jsonDeserialization_preservesIngressNodeBinding() throws Exception {
+        String json = """
+                {
+                  "id": "b_ing_1",
+                  "label": "Inbound Cancel",
+                  "type": "MESSAGE",
+                  "interrupting": false,
+                  "config": {
+                    "correlationKey": "${customerId}",
+                    "messageSource": "INGRESS_NODE",
+                    "ingressNodeBinding": {
+                      "templateId": "tpl-abc",
+                      "listenParamShortCode": "operation",
+                      "listenParamValue": "listen",
+                      "configurationParameters": [
+                        { "shortCode": "webhook_key", "value": { "$webhookKeyRef": "whk_aaaabbbbccccddddeeeeffff" } }
+                      ]
+                    }
+                  }
+                }
+                """;
+        BoundaryEventConfig cfg = JSON.readValue(json, BoundaryEventConfig.class);
+        assertTrue(cfg.isIngressNodeSource());
+        assertFalse(cfg.isInterrupting());
+        assertEquals("tpl-abc", cfg.getIngressNodeBinding().get("templateId"));
+        assertTrue(cfg.validate().isValid());
     }
 
     private static void assertRoundTrip(BoundaryEventConfig original, String... configPairs) throws Exception {

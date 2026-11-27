@@ -84,6 +84,11 @@ public class SecretResolver {
     private Object walk(Object v, String parentKey, Map<String, String> entries, List<ResolveFailure> failures) {
         if (v instanceof Map<?, ?> rawMap) {
             Map<String, Object> map = (Map<String, Object>) rawMap;
+            // Preserve {"$webhookKeyRef":"whk_..."} placeholders untouched: webhook keys are
+            // non-secret reference metadata resolved only by the daemon's webhook key store.
+            if (map.containsKey("$webhookKeyRef")) {
+                return map;
+            }
             // Forms 1 & 2: a $secretRef key (regardless of siblings) collapses to plaintext.
             Object refVal = map.get("$secretRef");
             if (refVal instanceof String refStr) {

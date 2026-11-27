@@ -94,7 +94,8 @@ public class SqsActivitiEngineConfig {
             "callActivityChildFailureListener",
             "callActivityFailurePropagationListener",
             "sharedErrorEndSentinelListener",
-            "userTaskApprovalListener"
+            "userTaskApprovalListener",
+            "sendAndWaitCorrelationPinDelegate"
     };
 
     @Bean

@@ -79,6 +79,8 @@ public class MessageReceiverCorrelationListener implements ExecutionListener {
 
     /** Activity id prefix the strategies mint: designer id {@code X} → activity id {@code node_X}. */
     private static final String NODE_ID_PREFIX = "node_";
+    /** Activity id prefix for the Phase-2 catch element of a {@code send_and_wait} compound node. */
+    private static final String CATCH_ID_PREFIX = "catch_";
     /** Activity id suffix of the synthesized event-based gateway in the timeout shape. */
     private static final String GATEWAY_ID_SUFFIX = "_ebg";
     /** Receiver INPUT port value whose mapped rows may carry a runtime correlation-key override. */
@@ -365,10 +367,16 @@ public class MessageReceiverCorrelationListener implements ExecutionListener {
     // Helpers.
     // ---------------------------------------------------------------------
 
-    /** Reverses the {@code node_<id>} activity-id convention the strategies mint at deploy time. */
+    /** Reverses the {@code node_<id>} / {@code catch_<id>} activity-id conventions minted at deploy time. */
     private static String stripNodePrefix(String activityId) {
-        if (activityId != null && activityId.startsWith(NODE_ID_PREFIX)) {
+        if (activityId == null) {
+            return null;
+        }
+        if (activityId.startsWith(NODE_ID_PREFIX)) {
             return activityId.substring(NODE_ID_PREFIX.length());
+        }
+        if (activityId.startsWith(CATCH_ID_PREFIX)) {
+            return activityId.substring(CATCH_ID_PREFIX.length());
         }
         return activityId;
     }

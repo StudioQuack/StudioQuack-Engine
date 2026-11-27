@@ -5,7 +5,9 @@ import com.studioquack.common.dto.flow.BoundaryEventConfig.BoundaryEventType;
 import com.studioquack.common.dto.flow.EdgeDto;
 import com.studioquack.common.dto.flow.NodeDto;
 import com.studioquack.common.dto.flow.TemplateDto;
+import com.studioquack.sqs.engine.WorkflowGraph;
 import com.studioquack.sqs.engine.runtime.EngineVariableNames;
+import com.studioquack.sqs.webhook.WebhookMessageNames;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.activiti.bpmn.model.Activity;
@@ -95,6 +97,33 @@ public class ActivitiBoundaryEventHelper {
 
     private final ActivitiSignalMessageRegistry registry;
     private final ActivitiMessageReceiverConfigurator receiverConfigurator;
+
+    /** Shared signal/message registry exposed for parameter-driven BPMN compilation. */
+    public ActivitiSignalMessageRegistry registry() {
+        return registry;
+    }
+
+    /** Shared message receiver configurator exposed for parameter-driven BPMN compilation. */
+    public ActivitiMessageReceiverConfigurator receiverConfigurator() {
+        return receiverConfigurator;
+    }
+
+    /**
+     * Resolves the effective BPMN message name for a {@code MESSAGE} boundary event: generic
+     * boundaries use their authored {@code config.messageName}; {@code INGRESS_NODE} boundaries
+     * use {@code config.messageName} when set or synthesise a deterministic
+     * {@code __sq_hook_<workflowId><ns>_<hostNodeId>_<boundaryId>} name.
+     */
+    public static String resolveMessageName(String workflowId, String namespaceSuffix,
+                                            String hostNodeId, BoundaryEventConfig cfg) {
+        if (cfg == null) {
+            return null;
+        }
+        if (cfg.isIngressNodeSource()) {
+            return WebhookMessageNames.forBoundary(workflowId, hostNodeId, cfg, namespaceSuffix);
+        }
+        return StringUtils.trimToNull(cfg.getMessageName());
+    }
 
     /**
  * Populates {@link BoundaryEventConfig#getTargetNodeId} on every boundary config from the
@@ -222,7 +251,7 @@ public class ActivitiBoundaryEventHelper {
             // Blank Error Code is an Activiti catch-all (no errorRef) routed to the wired handler.
             case ERROR -> true;
             case TIMER -> timerDefinition(nid, cfg) != null;
-            case MESSAGE -> StringUtils.isNotBlank(cfg.getMessageName());
+            case MESSAGE -> cfg.isIngressNodeSource() || StringUtils.isNotBlank(cfg.getMessageName());
             case SIGNAL -> StringUtils.isNotBlank(cfg.getSignalName());
             case ESCALATION -> StringUtils.isNotBlank(cfg.getEscalationCode());
             // Anything outside the five modelled types is not emitted (COMPENSATION/CONDITIONAL
@@ -377,7 +406,9 @@ public class ActivitiBoundaryEventHelper {
 
     private void attachMessage(BpmnModel model, Process process, String hostId, String nid,
                                String elementId, BoundaryEventConfig cfg) {
-        String messageName = StringUtils.trimToNull(cfg.getMessageName());
+        String wfId = WorkflowGraph.workflowIdOf(process.getId());
+        String nsSuffix = WorkflowGraph.namespaceSuffixOf(process.getId());
+        String messageName = resolveMessageName(wfId, nsSuffix, nid, cfg);
         MessageEventDefinition def = new MessageEventDefinition();
         def.setMessageRef(registry.getOrCreateMessage(model, messageName));
         BoundaryEvent boundary = newBoundary(process, elementId, hostId, cfg.isInterrupting());
@@ -393,8 +424,8 @@ public class ActivitiBoundaryEventHelper {
         }
         process.addFlowElement(boundary);
         route(process, boundary, cfg.getTargetNodeId());
-        log.debug("node={} message boundary {} name={} interrupting={}",
-                nid, boundary.getId(), messageName, cfg.isInterrupting());
+        log.debug("node={} message boundary {} name={} ingressNode={} interrupting={}",
+                nid, boundary.getId(), messageName, cfg.isIngressNodeSource(), cfg.isInterrupting());
     }
 
     private void attachSignal(BpmnModel model, Process process, String hostId, String nid,

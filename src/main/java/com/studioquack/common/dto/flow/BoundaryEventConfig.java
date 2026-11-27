@@ -3,12 +3,14 @@ package com.studioquack.common.dto.flow;
 import com.fasterxml.jackson.annotation.JsonAnySetter;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.studioquack.common.dto.webhook.WebhookKeyRefHelper;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import java.io.Serializable;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Configuration for a boundary event attached to a node.
@@ -219,6 +221,11 @@ public class BoundaryEventConfig implements Serializable {
     // Message Convenience Accessors
     // =====================================================================
 
+    public static final String CONFIG_MESSAGE_SOURCE = "messageSource";
+    public static final String CONFIG_INGRESS_NODE_BINDING = "ingressNodeBinding";
+    public static final String MESSAGE_SOURCE_GENERIC = "GENERIC";
+    public static final String MESSAGE_SOURCE_INGRESS_NODE = "INGRESS_NODE";
+
     @JsonIgnore
     public String getMessageName() {
         return getConfigString("messageName");
@@ -227,6 +234,41 @@ public class BoundaryEventConfig implements Serializable {
     @JsonIgnore
     public String getMessageCorrelationKey() {
         return getConfigString("correlationKey");
+    }
+
+    /**
+     * Source of the inbound message for a {@code MESSAGE} boundary event:
+     * {@code "GENERIC"} (default when absent/blank) or {@code "INGRESS_NODE"}
+     * (bound to a {@code listen}-capable node template + webhook key).
+     */
+    @JsonIgnore
+    public String getMessageSource() {
+        String source = getConfigString(CONFIG_MESSAGE_SOURCE);
+        return (source == null || source.isBlank()) ? MESSAGE_SOURCE_GENERIC : source.trim();
+    }
+
+    /** True when this {@code MESSAGE} boundary event is bound to an ingress node template. */
+    @JsonIgnore
+    public boolean isIngressNodeSource() {
+        return type == BoundaryEventType.MESSAGE
+                && MESSAGE_SOURCE_INGRESS_NODE.equalsIgnoreCase(getMessageSource());
+    }
+
+    /**
+     * Returns the {@code config.ingressNodeBinding} map for an {@code INGRESS_NODE}
+     * boundary event, or {@code null} when absent or not a map.
+     */
+    @JsonIgnore
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> getIngressNodeBinding() {
+        if (config == null) {
+            return null;
+        }
+        Object raw = config.get(CONFIG_INGRESS_NODE_BINDING);
+        if (raw instanceof Map<?, ?> map) {
+            return (Map<String, Object>) map;
+        }
+        return null;
     }
 
     // =====================================================================
@@ -451,6 +493,29 @@ public class BoundaryEventConfig implements Serializable {
                 }
                 break;
             case MESSAGE:
+                String source = getMessageSource();
+                if (MESSAGE_SOURCE_INGRESS_NODE.equalsIgnoreCase(source)) {
+                    Map<String, Object> binding = getIngressNodeBinding();
+                    if (binding == null || binding.isEmpty()) {
+                        return ValidationResult.error(
+                                "Ingress node message boundary requires config.ingressNodeBinding");
+                    }
+                    Object templateId = binding.get("templateId");
+                    if (!(templateId instanceof String tpl) || tpl.isBlank()) {
+                        return ValidationResult.error(
+                                "Ingress node message boundary requires ingressNodeBinding.templateId");
+                    }
+                    Set<String> webhookRefs = WebhookKeyRefHelper.collectFromIngressBinding(binding);
+                    if (webhookRefs.isEmpty()) {
+                        return ValidationResult.error(
+                                "Ingress node message boundary requires a bound webhook_key ($webhookKeyRef)");
+                    }
+                    break;
+                }
+                if (!MESSAGE_SOURCE_GENERIC.equalsIgnoreCase(source)) {
+                    return ValidationResult.error(
+                            "Message event config.messageSource must be 'GENERIC' or 'INGRESS_NODE'");
+                }
                 if (getMessageName() == null || getMessageName().isBlank()) {
                     return ValidationResult.error("Message event requires config.messageName");
                 }

@@ -1,5 +1,7 @@
 package com.studioquack.sqs.sandbox;
 
+import com.studioquack.sqs.sandbox.helperchan.WebhookIngressOutcome;
+
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -23,7 +25,27 @@ public record SandboxJobResponse(
         String errorCode,
         long wallMs,
         String containerId,
-        FailureKind failureKind) {
+        FailureKind failureKind,
+        WebhookIngressOutcome webhookOutcome,
+        String correlationKey) {
+
+    /** Back-compat 12-arg constructor for callers with no webhook outcome or correlation key. */
+    public SandboxJobResponse(
+            boolean ok,
+            int exitCode,
+            String stdout,
+            String stderr,
+            Map<String, Object> outputVariables,
+            Map<String, Object> appliedInputs,
+            boolean sealedOutputs,
+            String errorMessage,
+            String errorCode,
+            long wallMs,
+            String containerId,
+            FailureKind failureKind) {
+        this(ok, exitCode, stdout, stderr, outputVariables, appliedInputs, sealedOutputs,
+                errorMessage, errorCode, wallMs, containerId, failureKind, null, null);
+    }
 
     /**
      * Coarse classification of a dispatch failure, carried end-to-end onto the outbound
@@ -74,9 +96,22 @@ public record SandboxJobResponse(
     public static SandboxJobResponse success(int exitCode, String stdout, String stderr,
                                              Map<String, Object> portOutputs, long wallMs,
                                              String containerId) {
+        return success(exitCode, stdout, stderr, portOutputs, wallMs, containerId, null, null);
+    }
+
+    /**
+     * Builds a success response carrying optional ingress webhook outcomes and/or a Phase-1
+     * {@code send_and_wait} correlation key emitted via {@code studioquack.setCorrelationKey(...)}.
+     */
+    public static SandboxJobResponse success(int exitCode, String stdout, String stderr,
+                                             Map<String, Object> portOutputs, long wallMs,
+                                             String containerId,
+                                             WebhookIngressOutcome webhookOutcome,
+                                             String correlationKey) {
         Map<String, Object> out = withStdStreams(portOutputs, exitCode, stdout, stderr);
         return new SandboxJobResponse(true, exitCode, stdout, stderr, out,
-                Collections.emptyMap(), false, null, null, wallMs, containerId, FailureKind.NONE);
+                Collections.emptyMap(), false, null, null, wallMs, containerId, FailureKind.NONE,
+                webhookOutcome, correlationKey);
     }
 
     /**

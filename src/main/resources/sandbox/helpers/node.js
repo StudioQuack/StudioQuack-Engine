@@ -417,6 +417,37 @@ function _sqParseMaybeJson(text) {
   }
 }
 
+function _sqResolvePayloadPath(obj, path, fallback) {
+  if (obj === null || obj === undefined) return fallback;
+  const re = /([^.\[\]]+)|\[(\d+)\]|\[(?:"([^"]*)"|'([^']*)')\]/g;
+  let current = obj;
+  let matched = false;
+  let m;
+  while ((m = re.exec(path)) !== null) {
+    matched = true;
+    const prop = m[1];
+    const idx = m[2];
+    const dq = m[3];
+    const sq = m[4];
+    if (idx !== undefined) {
+      const i = Number(idx);
+      if (Array.isArray(current) && i >= 0 && i < current.length) {
+        current = current[i];
+      } else {
+        return fallback;
+      }
+    } else {
+      const key = prop !== undefined ? prop : (dq !== undefined ? dq : sq);
+      if (current !== null && typeof current === "object" && Object.prototype.hasOwnProperty.call(current, key)) {
+        current = current[key];
+      } else {
+        return fallback;
+      }
+    }
+  }
+  return matched ? current : fallback;
+}
+
 /**
  * Deliver a BPMN throw event (fail / escalate / signal / message): helper channel when reachable,
  * otherwise the equivalent `sqEvent:::{kind, ...body}` stdout marker the daemon folds at exit.
@@ -1154,6 +1185,164 @@ const studioquack = {
       body.correlationKey = correlationKey;
     }
     return _sqThrowEvent("message", "/v1/helper/message", body);
+  },
+
+  // ---- provider webhook ingress & send_and_wait helpers -------------------------
+
+  /** True when invoked by an inbound webhook on the node's webhook_key. */
+  isWebhookInvocation() {
+    const mode = _sqEc().invocationMode;
+    return typeof mode === "string" && mode.trim().toLowerCase() === "ingress";
+  },
+
+  /** Returns normalized {method, path, query, queryMulti, headers, rawBody, rawBodyBase64, rawBodyEncoding, body} or null. */
+  getWebhookRequest() {
+    if (!studioquack.isWebhookInvocation()) return null;
+    const req = _sqObj(_sqEc().webhookRequest);
+    if (!req) return null;
+    const out = Object.assign({}, req);
+    const hdrs = {};
+    if (_sqObj(req.headers)) {
+      Object.keys(req.headers).forEach((k) => {
+        hdrs[String(k).trim().toLowerCase()] = req.headers[k];
+      });
+    }
+    out.headers = hdrs;
+    return out;
+  },
+
+  /** Case-insensitive lookup of an inbound webhook HTTP header. */
+  getWebhookHeader(name, defaultValue) {
+    const fallback = defaultValue === undefined ? null : defaultValue;
+    if (!name || typeof name !== "string") return fallback;
+    const req = studioquack.getWebhookRequest();
+    if (!req || !req.headers) return fallback;
+    const key = name.trim().toLowerCase();
+    return Object.prototype.hasOwnProperty.call(req.headers, key) ? req.headers[key] : fallback;
+  },
+
+  /**
+   * Read parsed webhook body (JSON or application/x-www-form-urlencoded) or resolve a dot/bracket path
+   * such as 'value[0].resourceData' or 'entry[0].changes[0].value.messages[0]'.
+   */
+  getWebhookPayload(path, defaultValue) {
+    const fallback = defaultValue === undefined ? null : defaultValue;
+    const req = studioquack.getWebhookRequest();
+    if (!req) return fallback;
+    let payload = req.body !== undefined ? req.body : null;
+    if (payload === null && typeof req.rawBody === "string" && req.rawBody.trim() !== "") {
+      const ct = String(studioquack.getWebhookHeader("content-type", "") || "").toLowerCase();
+      if (ct.indexOf("application/x-www-form-urlencoded") >= 0) {
+        const params = new URLSearchParams(req.rawBody);
+        const parsed = {};
+        for (const [k, v] of params.entries()) {
+          if (!Object.prototype.hasOwnProperty.call(parsed, k)) parsed[k] = v;
+          else if (Array.isArray(parsed[k])) parsed[k].push(v);
+          else parsed[k] = [parsed[k], v];
+        }
+        payload = parsed;
+      } else if (ct.indexOf("json") >= 0 || /^[\s]*[{\[]/.test(req.rawBody)) {
+        try {
+          payload = JSON.parse(req.rawBody);
+        } catch (_e) {
+          payload = null;
+        }
+      }
+    }
+    if (path === undefined || path === null || String(path).trim() === "") {
+      return payload === null ? fallback : payload;
+    }
+    return _sqResolvePayloadPath(payload, String(path), fallback);
+  },
+
+  /**
+   * Constant-time HMAC-SHA256 verification against exact rawBody bytes (or payloadOverride).
+   * Accepts either a header name (e.g. 'X-Hub-Signature-256') or the raw signature header value.
+   */
+  verifyHmacSha256(secret, signatureHeader, prefix, payloadOverride) {
+    if (secret == null || !signatureHeader) return false;
+    const secretBuf = Buffer.isBuffer(secret) ? secret : Buffer.from(String(secret), "utf8");
+    if (secretBuf.length === 0) return false;
+    const hdrVal = studioquack.getWebhookHeader(String(signatureHeader));
+    let candidate = String(hdrVal !== null ? hdrVal : signatureHeader).trim();
+    const pfx = prefix === undefined ? "sha256=" : (prefix === null ? "" : String(prefix));
+    if (pfx) {
+      if (!candidate.startsWith(pfx)) return false;
+      candidate = candidate.slice(pfx.length).trim();
+    }
+    if (!candidate) return false;
+    let msgBuf;
+    if (payloadOverride !== undefined && payloadOverride !== null) {
+      msgBuf = Buffer.isBuffer(payloadOverride) ? payloadOverride : Buffer.from(String(payloadOverride), "utf8");
+    } else {
+      const req = studioquack.getWebhookRequest() || {};
+      if (typeof req.rawBodyBase64 === "string" && req.rawBodyBase64.length > 0) {
+        msgBuf = Buffer.from(req.rawBodyBase64, "base64");
+      } else {
+        msgBuf = Buffer.from(req.rawBody == null ? "" : String(req.rawBody), "utf8");
+      }
+    }
+    const crypto = require("crypto");
+    const expected = crypto.createHmac("sha256", secretBuf).update(msgBuf).digest("hex").toLowerCase();
+    const expectedBuf = Buffer.from(expected, "utf8");
+    const actualBuf = Buffer.from(candidate.toLowerCase(), "utf8");
+    if (expectedBuf.length !== actualBuf.length) return false;
+    return crypto.timingSafeEqual(expectedBuf, actualBuf);
+  },
+
+  /** Send an immediate verification handshake reply (no run start, no quota charge). */
+  respondWebhookChallenge(body, status, contentType) {
+    const payload = {
+      status: status == null ? 200 : Number(status),
+      contentType: contentType ? String(contentType) : "text/plain",
+      body: body == null ? "" : String(body),
+    };
+    _sqThrowEvent("webhook_challenge", "/v1/helper/webhook-challenge", payload);
+    if (_sqIsStateful()) return Object.assign({ ok: true }, payload);
+    process.exit(0);
+  },
+
+  /** Emit 1..100 normalized inbound webhook events [{idempotencyKey?, correlationKey?, payload}] to the engine. */
+  emitWebhookEvents(events) {
+    let rawList;
+    if (events == null) rawList = [];
+    else if (Array.isArray(events)) rawList = events;
+    else if (_sqObj(events)) rawList = [events];
+    else throw new TypeError("emitWebhookEvents expects an array of event objects");
+    const normalised = [];
+    const limit = Math.min(rawList.length, 100);
+    for (let i = 0; i < limit; i++) {
+      const item = _sqObj(rawList[i]);
+      if (!item) continue;
+      const ev = {};
+      const idem = item.idempotencyKey !== undefined ? item.idempotencyKey : item.idempotency_key;
+      const corr = item.correlationKey !== undefined ? item.correlationKey : item.correlation_key;
+      if (idem != null && String(idem).trim() !== "") ev.idempotencyKey = String(idem).trim();
+      if (corr != null && String(corr).trim() !== "") ev.correlationKey = String(corr).trim();
+      ev.payload = item.payload !== undefined ? item.payload : {};
+      normalised.push(ev);
+    }
+    _sqThrowEvent("webhook_events", "/v1/helper/webhook-events", { events: normalised });
+    return { ok: true, count: normalised.length };
+  },
+
+  /** Reject an unauthorized/invalid webhook cleanly (no quota charge). */
+  rejectWebhook(status, reason) {
+    const payload = {
+      status: status == null ? 401 : Number(status),
+      reason: reason ? String(reason) : "unauthorized",
+    };
+    _sqThrowEvent("webhook_reject", "/v1/helper/webhook-reject", payload);
+    if (_sqIsStateful()) return Object.assign({ ok: true }, payload);
+    process.exit(0);
+  },
+
+  /** Record the Phase-1 send_and_wait correlation key that will wake the parked reply catch. */
+  setCorrelationKey(key) {
+    const trimmed = key == null ? "" : String(key).trim();
+    if (!trimmed) throw new Error("correlationKey is required");
+    _sqThrowEvent("correlation_key", "/v1/helper/correlation-key", { correlationKey: trimmed });
+    return trimmed;
   },
 
   isCancelled() {

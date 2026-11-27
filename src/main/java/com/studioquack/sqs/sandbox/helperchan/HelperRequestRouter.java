@@ -473,6 +473,10 @@ public class HelperRequestRouter {
             case "engine-ip" -> handleEngineIp(body);
             case "execute/stream" -> handleExecuteStreamBuffered(job, body);
             case "emit-partial" -> handleEmitPartial(job, body);
+            case "webhook-challenge" -> handleWebhookChallenge(job, body);
+            case "webhook-events" -> handleWebhookEvents(job, body);
+            case "webhook-reject" -> handleWebhookReject(job, body);
+            case "correlation-key" -> handleCorrelationKey(job, body);
             default -> RoutedResponse.json(404, jsonBytes(Map.of("error", "no such endpoint", "path", sub)));
         };
     }
@@ -594,6 +598,116 @@ public class HelperRequestRouter {
         return routed(bpmnEventService.message(job, readBody(body, HelperEventRequest.class)));
     }
 
+    /** {@code POST /v1/helper/webhook-challenge} {@code {status?, contentType?, body}} → {@code {ok:true}}. */
+    @SuppressWarnings("unchecked")
+    private RoutedResponse handleWebhookChallenge(HelperJob job, byte[] body) {
+        Map<String, Object> b = readBody(body, Map.class);
+        if (b == null) {
+            return RoutedResponse.json(400, jsonBytes(Map.of("error", "bad json")));
+        }
+        int status = intOf(b.get("status"), 200);
+        String contentType = str(b.get("contentType"));
+        if (contentType.isBlank()) {
+            contentType = str(b.get("content_type"));
+        }
+        if (contentType.isBlank()) {
+            contentType = "text/plain";
+        }
+        String respBody = b.get("body") == null ? "" : String.valueOf(b.get("body"));
+        job.setWebhookChallenge(new WebhookIngressOutcome.WebhookChallenge(status, contentType, respBody));
+        return RoutedResponse.json(200, jsonBytes(Map.of("ok", true)));
+    }
+
+    /** {@code POST /v1/helper/webhook-events} {@code {events:[{idempotencyKey?,correlationKey?,payload}]}} (max 100). */
+    @SuppressWarnings("unchecked")
+    private RoutedResponse handleWebhookEvents(HelperJob job, byte[] body) {
+        Map<String, Object> b = readBody(body, Map.class);
+        if (b == null) {
+            return RoutedResponse.json(400, jsonBytes(Map.of("error", "bad json")));
+        }
+        Object rawEvents = b.get("events");
+        if (!(rawEvents instanceof List<?> list)) {
+            return RoutedResponse.json(400, jsonBytes(Map.of("error", "events array is required")));
+        }
+        List<WebhookIngressOutcome.WebhookEmittedEvent> parsed = parseWebhookEvents(list);
+        int accepted = job.appendWebhookEvents(parsed);
+        boolean capped = list.size() > accepted || parsed.size() > accepted;
+        return RoutedResponse.json(200, jsonBytes(Map.of("ok", true, "accepted", accepted, "capped", capped)));
+    }
+
+    /** {@code POST /v1/helper/webhook-reject} {@code {status?, reason?}} → {@code {ok:true}}. */
+    @SuppressWarnings("unchecked")
+    private RoutedResponse handleWebhookReject(HelperJob job, byte[] body) {
+        Map<String, Object> b = readBody(body, Map.class);
+        if (b == null) {
+            return RoutedResponse.json(400, jsonBytes(Map.of("error", "bad json")));
+        }
+        int status = intOf(b.get("status"), 401);
+        String reason = str(b.get("reason"));
+        if (reason.isBlank()) {
+            reason = "unauthorized";
+        }
+        job.setWebhookReject(new WebhookIngressOutcome.WebhookReject(status, reason));
+        return RoutedResponse.json(200, jsonBytes(Map.of("ok", true)));
+    }
+
+    /** {@code POST /v1/helper/correlation-key} {@code {correlationKey}} → {@code {ok:true}}. */
+    @SuppressWarnings("unchecked")
+    private RoutedResponse handleCorrelationKey(HelperJob job, byte[] body) {
+        Map<String, Object> b = readBody(body, Map.class);
+        if (b == null) {
+            return RoutedResponse.json(400, jsonBytes(Map.of("error", "bad json")));
+        }
+        String key = str(b.get("correlationKey"));
+        if (key.isBlank()) {
+            key = str(b.get("correlation_key"));
+        }
+        if (key.isBlank()) {
+            return RoutedResponse.json(400, jsonBytes(Map.of("error", "correlationKey is required")));
+        }
+        job.setCorrelationKey(key.trim());
+        return RoutedResponse.json(200, jsonBytes(Map.of("ok", true)));
+    }
+
+    /** Shared event-list parser (capped at {@link WebhookIngressOutcome#MAX_EVENTS}). */
+    @SuppressWarnings("unchecked")
+    public static List<WebhookIngressOutcome.WebhookEmittedEvent> parseWebhookEvents(List<?> rawList) {
+        if (rawList == null || rawList.isEmpty()) {
+            return List.of();
+        }
+        List<WebhookIngressOutcome.WebhookEmittedEvent> out =
+                new ArrayList<>(Math.min(rawList.size(), WebhookIngressOutcome.MAX_EVENTS));
+        for (Object item : rawList) {
+            if (out.size() >= WebhookIngressOutcome.MAX_EVENTS) {
+                break;
+            }
+            if (!(item instanceof Map<?, ?> m)) {
+                continue;
+            }
+            String idempotencyKey = emptyToNull(str(m.get("idempotencyKey")));
+            if (idempotencyKey == null) {
+                idempotencyKey = emptyToNull(str(m.get("idempotency_key")));
+            }
+            String correlationKey = emptyToNull(str(m.get("correlationKey")));
+            if (correlationKey == null) {
+                correlationKey = emptyToNull(str(m.get("correlation_key")));
+            }
+            Map<String, Object> payload;
+            Object rawPayload = m.get("payload");
+            if (rawPayload instanceof Map<?, ?> pm) {
+                Map<String, Object> copy = new LinkedHashMap<>();
+                pm.forEach((k, v) -> copy.put(String.valueOf(k), v));
+                payload = copy;
+            } else if (rawPayload != null) {
+                payload = Map.of("value", rawPayload);
+            } else {
+                payload = Map.of();
+            }
+            out.add(new WebhookIngressOutcome.WebhookEmittedEvent(idempotencyKey, correlationKey, payload));
+        }
+        return out;
+    }
+
     /**
      * Folds one {@code sqEvent:::} stdout marker of the emit-only SDKs ({@code bash.sh}, {@code
      * node.js} — no transport in the image) through the SAME handler the socket endpoint uses, so a
@@ -611,6 +725,10 @@ public class HelperRequestRouter {
             case "escalate" -> handleEscalate(job, body);
             case "signal" -> handleSignal(job, body);
             case "message" -> handleMessage(job, body);
+            case "webhook_challenge" -> handleWebhookChallenge(job, body);
+            case "webhook_events" -> handleWebhookEvents(job, body);
+            case "webhook_reject" -> handleWebhookReject(job, body);
+            case "correlation_key" -> handleCorrelationKey(job, body);
             default -> null;
         };
         if (response == null) {

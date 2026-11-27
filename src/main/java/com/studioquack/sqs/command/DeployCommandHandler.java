@@ -37,6 +37,14 @@ public class DeployCommandHandler implements DaemonCommandHandler {
     private final com.studioquack.sqs.files.DeployFileIngest deployFileIngest;
     private final CallActivityShortCodeResolver callActivityShortCodeResolver;
 
+    /** Null in slice tests that construct this handler by hand. */
+    private com.studioquack.sqs.webhook.DeployedWebhookBindingStore webhookBindingStore;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setWebhookBindingStore(com.studioquack.sqs.webhook.DeployedWebhookBindingStore webhookBindingStore) {
+        this.webhookBindingStore = webhookBindingStore;
+    }
+
     @Override
     public String type() {
         return TYPE;
@@ -68,9 +76,15 @@ public class DeployCommandHandler implements DaemonCommandHandler {
             // V6 reuse guard: pass the durable prior so an unchanged graph reuses its version.
             // A redeploy (operator re-deploys a project version) forces recompilation + a fresh engine
             // version even when the graph is byte-identical, so "Redeploy" always reloads the daemon.
+            WorkflowGraph graphForDeploy = payload.toGraph();
+            if (!payload.ephemeral() && webhookBindingStore != null) {
+                webhookBindingStore.validateStartCap(
+                        payload.workflowId(), graphForDeploy.namespaceSuffix(), payload.nodes());
+            }
+
             DeploymentInfo prior = artifactStore.findPriorDefinition(payload.workflowId());
             DeploymentInfo info = workflowDeploymentService.deploy(
-                    payload.toGraph(), prior, payload.redeploy(), payload.ephemeral());
+                    graphForDeploy, prior, payload.redeploy(), payload.ephemeral());
             if (payload.redeploy()) {
                 log.info("deploy.redeploy workflowId={} version={} — forced reload of the deployed definition",
                         payload.workflowId(), payload.version());
@@ -102,6 +116,11 @@ public class DeployCommandHandler implements DaemonCommandHandler {
             if (!payload.ephemeral()) {
                 artifactStore.saveWebhookAddress(artifactKey, payload.projectShortCode(),
                         payload.projectVersion(), payload.workflowShortCode());
+                if (webhookBindingStore != null) {
+                    webhookBindingStore.replaceForWorkflow(
+                            payload.workflowId(), deployedGraph.namespaceSuffix(),
+                            info.getProcessDefinitionId(), payload.nodes());
+                }
             }
 
             DeployResult result = new DeployResult(

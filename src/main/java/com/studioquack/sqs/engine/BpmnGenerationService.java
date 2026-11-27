@@ -4,14 +4,22 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.studioquack.common.dto.flow.EdgeDto;
 import com.studioquack.common.dto.flow.NodeDto;
 import com.studioquack.common.dto.flow.ParameterDto;
+import com.studioquack.common.dto.flow.SelectOptionParser;
+import com.studioquack.common.dto.flow.SelectOptionRole;
 import com.studioquack.common.dto.flow.TemplateDto;
 import com.studioquack.sqs.engine.bpmn.FeelToJuelTranslator;
+import com.studioquack.sqs.engine.delegate.SendAndWaitCorrelationPinDelegate;
 import com.studioquack.sqs.engine.expression.GatewayConditionCarriers;
 import com.studioquack.sqs.engine.runtime.EngineVariableNames;
 import com.studioquack.sqs.engine.strategy.ActivitiFlowNodeStrategy;
 import com.studioquack.sqs.engine.strategy.ActivitiFlowNodeStrategy.GeneratedNode;
 import com.studioquack.sqs.engine.strategy.helper.ActivitiBoundaryEventHelper;
 import com.studioquack.sqs.engine.strategy.helper.ActivitiBpmnElementHelper;
+import com.studioquack.sqs.engine.strategy.helper.ActivitiMessageReceiverConfigurator;
+import com.studioquack.sqs.engine.strategy.helper.ActivitiSignalMessageRegistry;
+import com.studioquack.sqs.engine.strategy.impl.ActivitiMessageCatchStrategy;
+import com.studioquack.sqs.engine.strategy.impl.ActivitiServiceTaskStrategy;
+import com.studioquack.sqs.webhook.WebhookMessageNames;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.activiti.bpmn.converter.BpmnXMLConverter;
@@ -26,9 +34,11 @@ import org.activiti.bpmn.model.ImplementationType;
 import org.activiti.bpmn.model.InclusiveGateway;
 import org.activiti.bpmn.model.IntermediateCatchEvent;
 import org.activiti.bpmn.model.LinkEventDefinition;
+import org.activiti.bpmn.model.MessageEventDefinition;
 import org.activiti.bpmn.model.ParallelGateway;
 import org.activiti.bpmn.model.Process;
 import org.activiti.bpmn.model.SequenceFlow;
+import org.activiti.bpmn.model.ServiceTask;
 import org.activiti.bpmn.model.StartEvent;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.stereotype.Service;
@@ -163,12 +173,16 @@ public class BpmnGenerationService {
         // 1a) Required-param gate BEFORE any strategy runs: a strategy may itself throw on an
         //     invalid param (the signal/message registry refuses blank names), but the gate's
         //     aggregated violation names every offending node and parameter at once.
+        validateListenNodesHaveNoIncomingEdges(nodes, subProcessNodes, mainEdges);
+
         List<String> requiredParamViolations = new ArrayList<>();
         for (NodeDto node : nodes) {
             if (subProcessNodes.contains(node.getId())) {
                 continue;
             }
+            SelectOptionRole role = parameterDrivenRole(node);
             if (!isDuckbotBoundaryNode(node, "start") && !isDuckbotBoundaryNode(node, "end")
+                    && role != SelectOptionRole.LISTEN
                     && !connectedByMainEdge.contains(node.getId())
                     && !isStructuralNode(effectiveBpmnType(node))) {
                 continue; // dropped as unreachable below — no gate for a node that never generates
@@ -191,6 +205,38 @@ public class BpmnGenerationService {
                 GeneratedNode generated = createDuckbotEndTask(model, process, node, resolveLabel(node));
                 generatedByNodeId.put(node.getId(), generated);
                 bpmnTypeByNodeId.put(node.getId(), "__sq_duckbot_end_task__");
+                continue;
+            }
+            SelectOptionRole activeRole = parameterDrivenRole(node);
+            if (activeRole != SelectOptionRole.NORMAL) {
+                if (activeRole != SelectOptionRole.LISTEN && !connectedByMainEdge.contains(node.getId())) {
+                    droppedUnreachable.add(node.getId() + "(role:" + activeRole + ")");
+                    continue;
+                }
+                String label = resolveLabel(node);
+                switch (activeRole) {
+                    case LISTEN -> {
+                        generatedByNodeId.put(node.getId(), createParameterDrivenListenStart(
+                                model, process, workflowId, namespaceSuffix, node, label));
+                        bpmnTypeByNodeId.put(node.getId(), "message.start.event");
+                    }
+                    case MESSAGE_CATCH -> {
+                        generatedByNodeId.put(node.getId(), createParameterDrivenMessageCatch(
+                                model, process, workflowId, namespaceSuffix, node, label));
+                        bpmnTypeByNodeId.put(node.getId(), "message.intermediate.catch.event");
+                    }
+                    case SEND_AND_WAIT -> {
+                        generatedByNodeId.put(node.getId(), createParameterDrivenSendAndWait(
+                                model, process, workflowId, namespaceSuffix, node, label));
+                        bpmnTypeByNodeId.put(node.getId(), "__sq_send_and_wait__");
+                    }
+                    case MESSAGE_THROW -> {
+                        generatedByNodeId.put(node.getId(), createParameterDrivenMessageThrow(
+                                model, process, node, label));
+                        bpmnTypeByNodeId.put(node.getId(), "__sq_message_throw__");
+                    }
+                    default -> { /* NORMAL never enters this branch */ }
+                }
                 continue;
             }
             String bpmnType = effectiveBpmnType(node);
@@ -358,14 +404,162 @@ public class BpmnGenerationService {
         return mainFlow;
     }
 
-    /** A node the engine may start the main process at: a structural start event or a Duckbot start. */
+    /** A node the engine may start the main process at: a structural start event, Duckbot start, or LISTEN node. */
     private boolean isMainFlowEntry(NodeDto node) {
         if (isDuckbotBoundaryNode(node, "start")) {
+            return true;
+        }
+        if (parameterDrivenRole(node) == SelectOptionRole.LISTEN) {
             return true;
         }
         String bpmnType = node.getData() == null ? null : node.getData().getBpmnType();
         String nodeType = node.getData() == null ? null : node.getData().getNodeType();
         return isStartLike(bpmnType) || "start".equalsIgnoreCase(nodeType);
+    }
+
+    /**
+     * Resolves the parameter-driven {@link SelectOptionRole} for a node BEFORE falling back to
+     * {@code ActivitiServiceTaskStrategy}. Standard BPMN nodes with a dedicated strategy (e.g.
+     * {@code message.start.event}, {@code message.intermediate.catch.event}, gateways, user tasks)
+     * always return {@link SelectOptionRole#NORMAL} and stay 100% unchanged.
+     */
+    private SelectOptionRole parameterDrivenRole(NodeDto node) {
+        TemplateDto data = node == null ? null : node.getData();
+        if (data == null) {
+            return SelectOptionRole.NORMAL;
+        }
+        if (hasSpecificStrategy(data.getBpmnType())) {
+            return SelectOptionRole.NORMAL;
+        }
+        return SelectOptionParser.resolveActiveRole(data);
+    }
+
+    /**
+     * Fails deploy loudly if any parameter-driven {@link SelectOptionRole#LISTEN} node has incoming
+     * main-flow sequence flows (mirroring the Canvas blocked INPUT port).
+     */
+    private void validateListenNodesHaveNoIncomingEdges(List<NodeDto> nodes, Set<String> subProcessNodes,
+                                                        List<EdgeDto> mainEdges) {
+        Map<String, NodeDto> listenNodes = new LinkedHashMap<>();
+        for (NodeDto node : nodes) {
+            if (node == null || subProcessNodes.contains(node.getId())) {
+                continue;
+            }
+            if (parameterDrivenRole(node) == SelectOptionRole.LISTEN) {
+                listenNodes.put(node.getId(), node);
+            }
+        }
+        if (listenNodes.isEmpty() || mainEdges == null || mainEdges.isEmpty()) {
+            return;
+        }
+        List<String> violations = new ArrayList<>();
+        for (EdgeDto edge : mainEdges) {
+            if (edge == null || edge.getTarget() == null) {
+                continue;
+            }
+            NodeDto target = listenNodes.get(edge.getTarget());
+            if (target != null) {
+                violations.add("LISTEN node '" + resolveLabel(target) + "' (" + target.getId()
+                        + ") has incoming sequence flow from '" + edge.getSource() + "'");
+            }
+        }
+        if (!violations.isEmpty()) {
+            throw new IllegalArgumentException("deploy validation failed — " + violations.size()
+                    + " LISTEN node(s) have illegal incoming sequence flow(s): ["
+                    + String.join("; ", violations) + "]");
+        }
+    }
+
+    /** Parameter-driven {@code LISTEN} → {@link StartEvent} + {@link MessageEventDefinition}. */
+    private GeneratedNode createParameterDrivenListenStart(BpmnModel model, Process process,
+                                                           String workflowId, String namespaceSuffix,
+                                                           NodeDto node, String label) {
+        String messageName = WebhookMessageNames.forNode(workflowId, node.getId(), namespaceSuffix);
+        ActivitiSignalMessageRegistry registry = boundaryEventHelper.registry();
+        ActivitiMessageReceiverConfigurator receiverCfg = boundaryEventHelper.receiverConfigurator();
+        String messageId = registry.getOrCreateMessage(model, messageName);
+
+        StartEvent startEvent = new StartEvent();
+        startEvent.setId("node_" + node.getId());
+        startEvent.setName(label);
+        MessageEventDefinition def = new MessageEventDefinition();
+        def.setMessageRef(messageId);
+        startEvent.addEventDefinition(def);
+        receiverCfg.configureReceiver(startEvent, node);
+        process.addFlowElement(startEvent);
+        return GeneratedNode.single(startEvent.getId());
+    }
+
+    /**
+     * Parameter-driven {@code MESSAGE_CATCH} → {@link IntermediateCatchEvent} (with optional
+     * {@code EventGateway → [MessageCatch, TimerCatch]} timeout branch when {@code timeoutMs > 0}).
+     */
+    private GeneratedNode createParameterDrivenMessageCatch(BpmnModel model, Process process,
+                                                            String workflowId, String namespaceSuffix,
+                                                            NodeDto node, String label) {
+        String messageName = WebhookMessageNames.forNode(workflowId, node.getId(), namespaceSuffix);
+        return resolveMessageCatchStrategy().createWithMessageName(
+                model, process, node, label, "node_" + node.getId(), messageName);
+    }
+
+    /**
+     * Parameter-driven {@code SEND_AND_WAIT} compound expansion:
+     * {@code node_X (async ServiceTask) → wait_X (ReceiveTask) → errgate_X (ServiceTask w/ Error Boundaries)
+     * → pin_X (ServiceTask pinning Phase-1 correlationKey) → catch_X (or EventGateway → [catch_X, timeout])}.
+     */
+    private GeneratedNode createParameterDrivenSendAndWait(BpmnModel model, Process process,
+                                                           String workflowId, String namespaceSuffix,
+                                                           NodeDto node, String label) {
+        String nid = node.getId();
+        String jobType = node.getData() == null ? null : node.getData().getJobType();
+        GeneratedNode phase1 = resolveElementHelper().emitAsyncSandboxTask(model, process, node, label, jobType);
+
+        ServiceTask pinTask = new ServiceTask();
+        pinTask.setId(SendAndWaitCorrelationPinDelegate.PIN_ID_PREFIX + nid);
+        pinTask.setName(label + " (pin correlation)");
+        pinTask.setImplementationType(ImplementationType.IMPLEMENTATION_TYPE_DELEGATEEXPRESSION);
+        pinTask.setImplementation(SendAndWaitCorrelationPinDelegate.DELEGATE_EXPRESSION);
+        process.addFlowElement(pinTask);
+        process.addFlowElement(newFlow("flow_" + nid + "_gate_to_pin", phase1.exitElementId(), pinTask.getId()));
+
+        String messageName = WebhookMessageNames.forNode(workflowId, nid, namespaceSuffix);
+        GeneratedNode phase2 = resolveMessageCatchStrategy().createWithMessageName(
+                model, process, node, label + " (await reply)", "catch_" + nid, messageName);
+        process.addFlowElement(newFlow("flow_" + nid + "_pin_to_catch", pinTask.getId(), phase2.entryElementId()));
+
+        return new GeneratedNode(phase1.entryElementId(), phase2.exitElementId(),
+                phase2.exitElementIdByPortValue());
+    }
+
+    /**
+     * Parameter-driven {@code MESSAGE_THROW} → async sandbox {@link ServiceTask}
+     * ({@code node_X → wait_X → errgate_X}), preserving egress controls, {@code $secretRef} isolation,
+     * and typed {@code BpmnError} handling.
+     */
+    private GeneratedNode createParameterDrivenMessageThrow(BpmnModel model, Process process,
+                                                            NodeDto node, String label) {
+        String jobType = node.getData() == null ? null : node.getData().getJobType();
+        return resolveElementHelper().emitAsyncSandboxTask(model, process, node, label, jobType);
+    }
+
+    private ActivitiMessageCatchStrategy resolveMessageCatchStrategy() {
+        for (ActivitiFlowNodeStrategy strategy : strategies) {
+            if (strategy instanceof ActivitiMessageCatchStrategy catchStrategy) {
+                return catchStrategy;
+            }
+        }
+        return new ActivitiMessageCatchStrategy(
+                boundaryEventHelper.registry(), boundaryEventHelper.receiverConfigurator());
+    }
+
+    private ActivitiBpmnElementHelper resolveElementHelper() {
+        for (ActivitiFlowNodeStrategy strategy : strategies) {
+            if (strategy instanceof ActivitiServiceTaskStrategy serviceTaskStrategy
+                    && serviceTaskStrategy.elementHelper() != null) {
+                return serviceTaskStrategy.elementHelper();
+            }
+        }
+        return new ActivitiBpmnElementHelper(boundaryEventHelper);
     }
 
     /**
@@ -1153,7 +1347,8 @@ public class BpmnGenerationService {
             String nodeType = node.getData() == null ? null : node.getData().getNodeType();
             // The root (a "start" in the parent graph) must become a task here, not a StartEvent —
             // force the fallback sandbox strategy for start-like nodes.
-            boolean startLike = isStartLike(bpmnType) || "start".equalsIgnoreCase(nodeType);
+            boolean startLike = isStartLike(bpmnType) || "start".equalsIgnoreCase(nodeType)
+                    || parameterDrivenRole(node) == SelectOptionRole.LISTEN;
             String effective = startLike ? "__sq_forced_task__" : effectiveBpmnType(node);
             collectRequiredParamViolations(node, subRequiredParamViolations);
             generated.put(nid, selectStrategy(effective).create(model, process, node, resolveLabel(node)));
@@ -1438,7 +1633,9 @@ public class BpmnGenerationService {
             // boolean), so a value-only edit (message name, correlationKey, timer expression)
             // busts the reuse cache instead of silently keeping the stale deployed XML.
             // Do NOT change the emitted BPMN without a version bump.
-            String canonical = "bpmn-signature:v9|"
+            // v10: parameter-driven select option roles (listen / message_catch / send_and_wait /
+            // message_throw) shape emitted BPMN, so parameter type + options are folded into the hash.
+            String canonical = "bpmn-signature:v10|"
                     + (name == null ? "" : name)
                     + "|nodes=" + signatureMapper.writeValueAsString(nodeShapes)
                     + "|edges=" + signatureMapper.writeValueAsString(edgeShapes);
@@ -1489,6 +1686,12 @@ public class BpmnGenerationService {
                     Map<String, Object> row = new LinkedHashMap<>();
                     row.put("shortCode", p.getShortCode());
                     row.put("value", p.getValue());
+                    if (p.getType() != null) {
+                        row.put("type", p.getType());
+                    }
+                    if (p.getOptions() != null && !p.getOptions().isEmpty()) {
+                        row.put("options", p.getOptions());
+                    }
                     configParams.add(row);
                 }
             }

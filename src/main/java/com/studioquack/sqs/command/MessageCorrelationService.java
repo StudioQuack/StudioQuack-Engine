@@ -2,8 +2,10 @@ package com.studioquack.sqs.command;
 
 import com.aventrix.jnanoid.jnanoid.NanoIdUtils;
 import com.studioquack.common.dto.flow.BoundaryEventConfig;
+import com.studioquack.common.dto.flow.EdgeDto;
 import com.studioquack.common.dto.flow.InOutValueDto;
 import com.studioquack.common.dto.flow.NodeDto;
+import com.studioquack.common.dto.flow.PortDto;
 import com.studioquack.common.dto.flow.ProcessContextRef;
 import com.studioquack.sqs.command.store.DeployedArtifactStore;
 import com.studioquack.sqs.engine.SqsEngine;
@@ -16,6 +18,7 @@ import com.studioquack.sqs.execution.crypto.ExecutionContextCrypto;
 import com.studioquack.sqs.execution.runtime.RefOnlyVariableGuard;
 import com.studioquack.sqs.execution.store.ExecutionContextStore;
 import com.studioquack.sqs.runtime.GatewayRouteResolver;
+import com.studioquack.sqs.webhook.WebhookMessageNames;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -847,8 +850,7 @@ public class MessageCorrelationService {
             // activityId, never from req.nodeId(): the intra-engine sender bridge puts the
             // SENDER's node id there, and sealing/fanning out against a node that does not exist
             // in the receiver's definition aborts the correlation (surfaced by audit C6).
-            targetNodeId = StringUtils.removeStart(parked.getActivityId(),
-                    SqsEngine.NODE_ELEMENT_ID_PREFIX);
+            targetNodeId = stripElementPrefix(parked.getActivityId());
             if (StringUtils.isBlank(targetNodeId)) {
                 targetNodeId = req.nodeId();
             }
@@ -867,13 +869,15 @@ public class MessageCorrelationService {
         // The template's promised catch envelope (messageName/correlationKey/payload/payloadRef/…)
         // fans out to the event node's downstream BEFORE the trigger, so a fan-out failure aborts
         // the correlation cleanly — nothing engine-side has happened yet and the caller can retry
-        // instead of losing the envelope downstream (same contract as writeTaskOutputs). Boundary
-        // kinds are excluded: their sealed rows target the HANDLER node directly, which consumes
-        // them on dispatch — no event-node fan-out exists there.
+        // instead of losing the envelope downstream (same contract as writeTaskOutputs).
         if ((req.eventType() == SqEventType.MESSAGE_CATCH || req.eventType() == SqEventType.SIGNAL_CATCH)
                 && seal.ref() != null) {
             fanOutEventEnvelope(req, sealBusinessKey, targetNodeId,
                     processDefinitionIdOf(processInstanceId), seal.ref());
+        } else if (req.eventType() == SqEventType.BOUNDARY_MESSAGE
+                && WebhookMessageNames.isHookMessageName(req.name())
+                && req.msg() != null && !req.msg().isEmpty()) {
+            sealIngressBoundaryPayload(req, sealBusinessKey);
         }
 
 
@@ -925,7 +929,9 @@ public class MessageCorrelationService {
         boolean signal = req.eventType() == SqEventType.BOUNDARY_SIGNAL;
         for (ActivitiBoundaryEventHelper.PlannedBoundary planned : boundaryEventHelper.planBoundaries(hostNode)) {
             BoundaryEventConfig cfg = planned.config();
-            String cfgName = signal ? cfg.getSignalName() : cfg.getMessageName();
+            String cfgName = signal
+                    ? cfg.getSignalName()
+                    : ActivitiBoundaryEventHelper.resolveMessageName(req.workflowId(), "", hostNode.getId(), cfg);
             if (Objects.equals(req.name(), cfgName) && StringUtils.isNotBlank(cfg.getTargetNodeId())) {
                 return cfg.getTargetNodeId();
             }
@@ -934,6 +940,124 @@ public class MessageCorrelationService {
         // end (nothing downstream reads ports there); seal to the host node id anyway so the ref
         // exists for observability even though nothing currently consumes it.
         return hostNode.getId();
+    }
+
+    /**
+     * Seals an ingress-node {@code BOUNDARY_MESSAGE} payload onto the boundary's handler edge
+     * ({@code nodeId = hostNodeId}, {@code portId/portValue = boundaryId}) so downstream DuckTape
+     * mappings against the inherited ingress output schema resolve immediately.
+     */
+    private void sealIngressBoundaryPayload(WebhookEventRequest req, String businessKey) {
+        if (StringUtils.isAnyBlank(req.workflowId(), req.nodeId(), businessKey)) {
+            return;
+        }
+        artifactStore.loadDeployedGraph(req.workflowId()).ifPresent(graph -> {
+            NodeDto hostNode = findHostNode(graph.nodes(), req.nodeId()).orElse(null);
+            if (hostNode == null) {
+                return;
+            }
+            BoundaryEventConfig matchedCfg = null;
+            for (ActivitiBoundaryEventHelper.PlannedBoundary planned : boundaryEventHelper.planBoundaries(hostNode)) {
+                BoundaryEventConfig cfg = planned.config();
+                if (cfg == null || cfg.getType() != BoundaryEventConfig.BoundaryEventType.MESSAGE) {
+                    continue;
+                }
+                String resolved = ActivitiBoundaryEventHelper.resolveMessageName(
+                        req.workflowId(), "", hostNode.getId(), cfg);
+                if (Objects.equals(req.name(), resolved)) {
+                    matchedCfg = cfg;
+                    break;
+                }
+            }
+            if (matchedCfg == null || StringUtils.isBlank(matchedCfg.getId()) || graph.edges() == null) {
+                return;
+            }
+            EdgeDto handlerEdge = null;
+            for (EdgeDto edge : graph.edges()) {
+                if (edge != null && edge.getData() != null
+                        && hostNode.getId().equals(edge.getSource())
+                        && matchedCfg.getId().equals(StringUtils.trimToNull(edge.getData().getBoundaryEventId()))
+                        && StringUtils.isNotBlank(edge.getTarget())) {
+                    handlerEdge = edge;
+                    break;
+                }
+            }
+            if (handlerEdge == null) {
+                return;
+            }
+            ExecutionContext boundaryCtx = new ExecutionContext();
+            boundaryCtx.setWorkflowExecutionId(businessKey);
+            boundaryCtx.setWorkflowId(req.workflowId());
+            boundaryCtx.setCurrentNodeId(matchedCfg.getId());
+
+            InOutValueDto out = new InOutValueDto();
+            out.setNodeId(hostNode.getId());
+            out.setPortId(matchedCfg.getId());
+            out.setPortValue(matchedCfg.getId());
+            out.setTargetNodeId(handlerEdge.getTarget());
+            String tgtPortValue = parseHandlePortValue(handlerEdge.getTargetHandle());
+            if (StringUtils.isNotBlank(tgtPortValue)) {
+                out.setTargetPortValue(tgtPortValue);
+                out.setTargetPortId(resolveTargetPortId(graph.nodes(), handlerEdge.getTarget(), tgtPortValue));
+            }
+            // If payload wraps a single port value map (e.g. {"output": {...}}), unwrap it for the
+            // boundary's inherited output schema; otherwise publish the payload map directly.
+            Object value = unwrapSinglePortMapIfApplicable(req.msg());
+            out.setValue(value);
+
+            executionContextStore.saveOutputs(executionContextStore.snapshot(boundaryCtx, null), List.of(out));
+            log.info("webhook.boundary-ingress.sealed workflowId={} host={} boundary={} handler={}",
+                    req.workflowId(), hostNode.getId(), matchedCfg.getId(), handlerEdge.getTarget());
+        });
+    }
+
+    private static Object unwrapSinglePortMapIfApplicable(Map<String, Object> msg) {
+        if (msg == null) {
+            return Map.of();
+        }
+        if (msg.size() == 1) {
+            Object only = msg.values().iterator().next();
+            if (only instanceof Map<?, ?>) {
+                return only;
+            }
+        }
+        return msg;
+    }
+
+    private static String parseHandlePortValue(String handle) {
+        if (StringUtils.isBlank(handle)) {
+            return null;
+        }
+        int dash = handle.indexOf('-');
+        return dash >= 0 && dash < handle.length() - 1 ? handle.substring(dash + 1).trim() : null;
+    }
+
+    private static String resolveTargetPortId(List<NodeDto> nodes, String targetNodeId, String portValue) {
+        if (nodes == null || StringUtils.isAnyBlank(targetNodeId, portValue)) {
+            return portValue;
+        }
+        for (NodeDto node : nodes) {
+            if (node != null && targetNodeId.equals(node.getId()) && node.getData() != null) {
+                PortDto port = node.getData().findPortByPortName(portValue);
+                if (port != null && StringUtils.isNotBlank(port.getId())) {
+                    return port.getId();
+                }
+            }
+        }
+        return portValue;
+    }
+
+    private static String stripElementPrefix(String activityId) {
+        if (activityId == null) {
+            return null;
+        }
+        if (activityId.startsWith(SqsEngine.NODE_ELEMENT_ID_PREFIX)) {
+            return activityId.substring(SqsEngine.NODE_ELEMENT_ID_PREFIX.length());
+        }
+        if (activityId.startsWith("catch_")) {
+            return activityId.substring("catch_".length());
+        }
+        return activityId;
     }
 
     /**
@@ -1114,20 +1238,67 @@ public class MessageCorrelationService {
         ProcessContextRef writeRef = executionContextStore.snapshot(ctx, null);
 
         List<InOutValueDto> outputs = new ArrayList<>(downstreamIds.size());
-        for (String downstreamId : downstreamIds) {
-            InOutValueDto dto = new InOutValueDto();
-            dto.setNodeId(eventNodeId);
-            dto.setPortId(portValue);
-            dto.setPortValue(portValue);
-            dto.setTargetNodeId(downstreamId);
-            dto.setTargetPortId(portValue);
-            dto.setTargetPortValue(portValue);
-            dto.setValue(envelope);
-            outputs.add(dto);
+        boolean hookFanOutWritten = false;
+        if (!signal && WebhookMessageNames.isHookMessageName(req.name())
+                && StringUtils.isNotBlank(req.workflowId()) && req.msg() != null) {
+            hookFanOutWritten = appendHookEdgeOutputs(req, eventNodeId, outputs);
+        }
+        if (!hookFanOutWritten) {
+            for (String downstreamId : downstreamIds) {
+                InOutValueDto dto = new InOutValueDto();
+                dto.setNodeId(eventNodeId);
+                dto.setPortId(portValue);
+                dto.setPortValue(portValue);
+                dto.setTargetNodeId(downstreamId);
+                dto.setTargetPortId(portValue);
+                dto.setTargetPortValue(portValue);
+                dto.setValue(envelope);
+                outputs.add(dto);
+            }
         }
         executionContextStore.saveOutputs(writeRef, outputs);
         log.info("event.envelope-fanned node={} port={} downstream={} businessKey={}",
                 eventNodeId, portValue, downstreamIds.size(), businessKey);
+    }
+
+    /**
+     * Fans out a parameter-driven ingress node's emitted payload onto the node's actual outgoing
+     * graph edges ({@code sourceHandle = OUTPUT-<srcPort>}, {@code targetHandle = INPUT-<tgtPort>})
+     * so downstream DuckTape mappings and {@code getInputValuesByPortValue} receive the node's own
+     * declared OUTPUT port values verbatim.
+     */
+    private boolean appendHookEdgeOutputs(WebhookEventRequest req, String eventNodeId,
+                                          List<InOutValueDto> outputs) {
+        Optional<DeployedArtifactStore.DeployedGraph> graphOpt =
+                artifactStore.loadDeployedGraph(req.workflowId());
+        if (graphOpt.isEmpty() || graphOpt.get().edges() == null) {
+            return false;
+        }
+        DeployedArtifactStore.DeployedGraph graph = graphOpt.get();
+        int added = 0;
+        for (EdgeDto edge : graph.edges()) {
+            if (edge == null || !eventNodeId.equals(edge.getSource()) || StringUtils.isBlank(edge.getTarget())) {
+                continue;
+            }
+            if (edge.getData() != null && StringUtils.isNotBlank(edge.getData().getBoundaryEventId())) {
+                continue;
+            }
+            String srcPort = StringUtils.defaultIfBlank(parseHandlePortValue(edge.getSourceHandle()), MESSAGE_OUT_PORT);
+            String tgtPort = StringUtils.defaultIfBlank(parseHandlePortValue(edge.getTargetHandle()), srcPort);
+            Object portVal = req.msg().containsKey(srcPort) ? req.msg().get(srcPort) : req.msg();
+
+            InOutValueDto dto = new InOutValueDto();
+            dto.setNodeId(eventNodeId);
+            dto.setPortId(srcPort);
+            dto.setPortValue(srcPort);
+            dto.setTargetNodeId(edge.getTarget());
+            dto.setTargetPortValue(tgtPort);
+            dto.setTargetPortId(resolveTargetPortId(graph.nodes(), edge.getTarget(), tgtPort));
+            dto.setValue(portVal);
+            outputs.add(dto);
+            added++;
+        }
+        return added > 0;
     }
 
     /**
@@ -1195,7 +1366,12 @@ public class MessageCorrelationService {
             throw new IllegalStateException(
                     "event-envelope: deployed model unreadable for " + processDefinitionId);
         }
-        FlowElement fe = model.getFlowElement(SqsEngine.NODE_ELEMENT_ID_PREFIX + eventNodeId);
+        // For SEND_AND_WAIT compound nodes, the catch element is catch_<id> (node_<id> is the Phase-1
+        // async service task whose outgoing flow goes to wait_<id>, not the downstream nodes).
+        FlowElement fe = model.getFlowElement("catch_" + eventNodeId);
+        if (fe == null) {
+            fe = model.getFlowElement(SqsEngine.NODE_ELEMENT_ID_PREFIX + eventNodeId);
+        }
         if (!(fe instanceof FlowNode flowNode)) {
             throw new IllegalStateException(
                     "event-envelope: event element node_" + eventNodeId + " missing in " + processDefinitionId);

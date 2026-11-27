@@ -9,6 +9,7 @@ import com.studioquack.sqs.sandbox.helperchan.HelperJob;
 import com.studioquack.sqs.sandbox.helperchan.HelperRequestRouter;
 import com.studioquack.sqs.sandbox.helperchan.HelperResult;
 import com.studioquack.sqs.sandbox.helperchan.StreamSessionManager;
+import com.studioquack.sqs.sandbox.helperchan.WebhookIngressOutcome;
 import com.studioquack.sqs.sandbox.oci.HelperBroker;
 import com.studioquack.sqs.sandbox.redactor.Redactor;
 import com.studioquack.sqs.runtime.DispatchCancellationRegistry;
@@ -473,6 +474,20 @@ public class StatefulSandboxExecution {
         }
         req.put("executionContext", job.executionContext());
         req.put("inputVariables", job.inputVariables());
+        if (job.executionContext() != null) {
+            Object mode = job.executionContext().get("invocationMode");
+            if (mode != null) {
+                req.put("invocationMode", mode);
+            }
+            Object role = job.executionContext().get("activeSelectRole");
+            if (role != null) {
+                req.put("activeSelectRole", role);
+            }
+            Object whReq = job.executionContext().get("webhookRequest");
+            if (whReq != null) {
+                req.put("webhookRequest", whReq);
+            }
+        }
         if (helperToken != null) {
             req.put("helperToken", helperToken);
         }
@@ -499,14 +514,17 @@ public class StatefulSandboxExecution {
                                           long wallMs) {
         String rawStdout = outcome.stdout();
         String rawStderr = outcome.stderr();
-        Map<String, Object> outputs = mergeOutputs(helperToken, rawStdout);
+        Map<String, Object> parsedBody = parseResponseBody(rawStdout);
+        WebhookIngressOutcome webhookOutcome = extractWebhookOutcome(helperToken, parsedBody);
+        String correlationKey = extractCorrelationKey(helperToken, parsedBody);
+        Map<String, Object> outputs = mergeOutputs(helperToken, parsedBody);
         // Data-flow checkpoint (shape only): the launcher stdout IS the result transport, so its
         // byte count + the parsed port keys are the two facts that decide whether the caller sees
         // the node's outputs. An empty parsedPorts on a non-blank stdout is the truncation tell.
         log.info("[SQ-6] stateful.result job={} node={} exit={} stdoutBytes={} parsedPorts={}",
                 job.jobId(), job.currentNodeId(), outcome.exitCode(),
                 rawStdout == null ? -1 : rawStdout.length(), outputs.keySet());
-        if (outcome.exitCode() == 0 && !outcome.timedOut() && outputs.isEmpty()
+        if (outcome.exitCode() == 0 && !outcome.timedOut() && outputs.isEmpty() && webhookOutcome == null
                 && rawStdout != null && !rawStdout.isBlank()) {
             int cap = (int) Math.min(Integer.MAX_VALUE,
                     Math.max(1024, props.getStatefulResponseMaxBytes()));
@@ -571,7 +589,8 @@ public class StatefulSandboxExecution {
                     "stateful launcher exited non-zero (" + outcome.exitCode() + ")", wallMs, containerId,
                     SandboxJobResponse.FailureKind.SCRIPT);
         }
-        return SandboxJobResponse.success(outcome.exitCode(), stdout, stderr, outputs, wallMs, containerId);
+        return SandboxJobResponse.success(outcome.exitCode(), stdout, stderr, outputs, wallMs, containerId,
+                webhookOutcome, correlationKey);
     }
 
     private HelperFailure typedFailure(String helperToken) {
@@ -623,11 +642,25 @@ public class StatefulSandboxExecution {
         return sb == null ? stdout : sb.toString();
     }
 
+    /** Reserved direct-JSON response keys for stateful webhook ingress and send-and-wait correlation. */
+    public static final String KEY_WEBHOOK_CHALLENGE = "__sq_webhook_challenge";
+    public static final String KEY_WEBHOOK_EVENTS = "__sq_webhook_events";
+    public static final String KEY_WEBHOOK_REJECT = "__sq_webhook_reject";
+    public static final String KEY_CORRELATION_KEY = "__sq_correlation_key";
+
     /** Helper-channel {@code /result} wins; the launcher's captured app response fills gaps. */
-    private Map<String, Object> mergeOutputs(String helperToken, String rawStdout) {
+    private Map<String, Object> mergeOutputs(String helperToken, Map<String, Object> parsedBody) {
         Map<String, Object> out = new LinkedHashMap<>();
         // Launcher stdout (the app's HTTP response) first, so the helper result overwrites on conflict.
-        parseResponseBody(rawStdout).forEach(out::put);
+        // Strip reserved __sq_* protocol keys so they never pollute normal output ports.
+        parsedBody.forEach((k, v) -> {
+            if (!KEY_WEBHOOK_CHALLENGE.equals(k)
+                    && !KEY_WEBHOOK_EVENTS.equals(k)
+                    && !KEY_WEBHOOK_REJECT.equals(k)
+                    && !KEY_CORRELATION_KEY.equals(k)) {
+                out.put(k, v);
+            }
+        });
         if (helperToken != null) {
             Optional<HelperJob> job = helperRouter.lookup(helperToken);
             if (job.isPresent() && job.get().result() != null) {
@@ -645,6 +678,55 @@ public class StatefulSandboxExecution {
             }
         }
         return out;
+    }
+
+    /** Combines helper-channel webhook reports (preferred) with stateful direct JSON keys. */
+    private WebhookIngressOutcome extractWebhookOutcome(String helperToken, Map<String, Object> parsedBody) {
+        WebhookIngressOutcome.WebhookChallenge challenge = null;
+        WebhookIngressOutcome.WebhookReject reject = null;
+        java.util.List<WebhookIngressOutcome.WebhookEmittedEvent> events = new java.util.ArrayList<>();
+
+        if (helperToken != null) {
+            Optional<HelperJob> jobOpt = helperRouter.lookup(helperToken);
+            if (jobOpt.isPresent()) {
+                HelperJob hj = jobOpt.get();
+                challenge = hj.webhookChallenge();
+                reject = hj.webhookReject();
+                events.addAll(hj.webhookEvents());
+            }
+        }
+        if (challenge == null && parsedBody.get(KEY_WEBHOOK_CHALLENGE) instanceof Map<?, ?> cm) {
+            int status = cm.get("status") instanceof Number n ? n.intValue() : 200;
+            String ct = cm.get("contentType") != null ? String.valueOf(cm.get("contentType")) : "text/plain";
+            String body = cm.get("body") != null ? String.valueOf(cm.get("body")) : "";
+            challenge = new WebhookIngressOutcome.WebhookChallenge(status, ct, body);
+        }
+        if (reject == null && parsedBody.get(KEY_WEBHOOK_REJECT) instanceof Map<?, ?> rm) {
+            int status = rm.get("status") instanceof Number n ? n.intValue() : 401;
+            String reason = rm.get("reason") != null ? String.valueOf(rm.get("reason")) : "unauthorized";
+            reject = new WebhookIngressOutcome.WebhookReject(status, reason);
+        }
+        if (events.isEmpty() && parsedBody.get(KEY_WEBHOOK_EVENTS) instanceof java.util.List<?> rawEvents) {
+            events.addAll(HelperRequestRouter.parseWebhookEvents(rawEvents));
+        }
+        if (challenge == null && reject == null && events.isEmpty()) {
+            return null;
+        }
+        return new WebhookIngressOutcome(challenge, reject, events);
+    }
+
+    private String extractCorrelationKey(String helperToken, Map<String, Object> parsedBody) {
+        if (helperToken != null) {
+            String fromHelper = helperRouter.lookup(helperToken).map(HelperJob::correlationKey).orElse(null);
+            if (fromHelper != null && !fromHelper.isBlank()) {
+                return fromHelper.trim();
+            }
+        }
+        Object direct = parsedBody.get(KEY_CORRELATION_KEY);
+        if (direct != null && !String.valueOf(direct).isBlank()) {
+            return String.valueOf(direct).trim();
+        }
+        return null;
     }
 
     /**

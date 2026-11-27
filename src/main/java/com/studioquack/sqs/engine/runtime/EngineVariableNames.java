@@ -52,6 +52,15 @@ public final class EngineVariableNames {
     public static final String MSG_CORR_PREFIX = RESERVED_PREFIX + "msgcorr_";
 
     /**
+     * Execution/process-scoped handoff prefix for {@code send_and_wait} Phase 1 → Phase 2:
+     * when Phase 1 emits {@code studioquack.setCorrelationKey(key)}, {@code ScriptDispatchDelegate}
+     * writes it under {@code __sq_swcorr_<sanitizedNodeId>} so the post-error-gate {@code pin_<id>}
+     * delegate can pin it onto {@code __sq_msgcorr_<messageName>} before the catch parks.
+     * Non-PHI routing token (same class as {@link #MSG_CORR_PREFIX}).
+     */
+    public static final String SEND_WAIT_CORR_PREFIX = RESERVED_PREFIX + "swcorr_";
+
+    /**
      * Process-instance-scoped <b>start correlation key</b> of a message-started run: the key the
      * caller addressed (external webhook {@code correlationKey} / intra-engine bridge key) or the
      * receiver-derived key ({@code businessKeyExpression} / static receiver key) — correlation
@@ -124,6 +133,11 @@ public final class EngineVariableNames {
      */
     public static String messageCorrelationVariableName(String messageName) {
         return MSG_CORR_PREFIX + sanitizeToIdentifier(messageName);
+    }
+
+    /** The Phase-1 {@code send_and_wait} correlation-key handoff variable name for {@code nodeId}. */
+    public static String sendWaitCorrelationVariableName(String nodeId) {
+        return SEND_WAIT_CORR_PREFIX + sanitizeToIdentifier(nodeId);
     }
 
     /** Maps an arbitrary authored string to a JUEL-legal identifier (see {@link #routeTokenVariableName}). */
@@ -262,7 +276,8 @@ public final class EngineVariableNames {
             return false;
         }
         return WHITELIST_FOR_PERSIST.contains(name) || name.startsWith(ROUTE_PREFIX)
-                || name.startsWith(MSG_CORR_PREFIX) || name.startsWith(CALL_BK_PREFIX)
+                || name.startsWith(MSG_CORR_PREFIX) || name.startsWith(SEND_WAIT_CORR_PREFIX)
+                || name.startsWith(CALL_BK_PREFIX)
                 || name.startsWith(CALL_FAIL_PREFIX) || name.startsWith(RETRY_PREFIX);
     }
 }

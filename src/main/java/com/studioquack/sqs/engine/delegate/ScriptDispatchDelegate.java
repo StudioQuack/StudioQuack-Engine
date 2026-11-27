@@ -7,6 +7,8 @@ import com.studioquack.common.dto.flow.ExecutionRequirementsDto;
 import com.studioquack.common.dto.flow.InOutValueDto;
 import com.studioquack.common.dto.flow.NodeDto;
 import com.studioquack.common.dto.flow.ProcessContextRef;
+import com.studioquack.common.dto.flow.SelectOptionParser;
+import com.studioquack.common.dto.flow.SelectOptionRole;
 import com.studioquack.sqs.engine.WorkflowGraph;
 import com.studioquack.sqs.engine.SqsEngine;
 import com.studioquack.sqs.engine.expression.ConfigParameterExpressionResolver;
@@ -544,6 +546,10 @@ public class ScriptDispatchDelegate implements JavaDelegate {
             // from the OS key manager. `ctx` itself is never mutated, so the resolved plaintext never
             // reaches the sealed execution_context store, the engine variables, or any log/audit.
             Map<String, Object> sandboxContext = toContextMap(ctx);              // graph-less, currentNode = handles
+            sandboxContext.put("invocationMode", "normal");
+            SelectOptionRole activeRole = SelectOptionParser.resolveActiveRole(
+                    ctx.getCurrentNode() == null ? null : ctx.getCurrentNode().getData());
+            sandboxContext.put("activeSelectRole", activeRole.name().toLowerCase(java.util.Locale.ROOT));
             Map<String, Object> sandboxInputVars = privateInputSnapshot(prepared.inputVariables());
             Set<String> secretLiterals = new LinkedHashSet<>();
             // Scope: the CURRENT node ONLY (never the `nodes` graph) so a node's container can never
@@ -712,7 +718,14 @@ public class ScriptDispatchDelegate implements JavaDelegate {
                 ctx.setEdges(graphEdges);
                 Map<String, Object> routeTokens = routeResolver.resolveRouteTokens(
                         graphNodes, graphEdges, nodeId, currentOutputs(ctx), ctx);
-                Map<String, Object> engineVars = refOnlyVarBuilder.toEngineVariables(ctx);
+                Map<String, Object> engineVars = new LinkedHashMap<>(refOnlyVarBuilder.toEngineVariables(ctx));
+                // Phase 1 of send_and_wait: pass the emitted correlationKey as a REF-only routing
+                // token so the immediately following pin_<nodeId> delegate pins __sq_msgcorr_<name>.
+                if (StringUtils.isNotBlank(response.correlationKey())) {
+                    engineVars.put(
+                            EngineVariableNames.sendWaitCorrelationVariableName(nodeId),
+                            response.correlationKey().trim());
+                }
                 resultCoordinator.deliverSuccess(dispatchId, engineVars, routeTokens);
             } else {
                 // Language-match transform prelude failures surface as B-job failures — remap codes.

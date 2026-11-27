@@ -774,7 +774,22 @@ public class PodmanSandboxExecution implements SandboxExecutionPort {
                     SandboxJobResponse.ERROR_SANDBOX_FAILED,
                     detail, wallMs, containerId, SandboxJobResponse.FailureKind.SCRIPT);
         }
-        return SandboxJobResponse.success(result.exitCode(), stdout, stderr, outputs, wallMs, containerId);
+        return SandboxJobResponse.success(result.exitCode(), stdout, stderr, outputs, wallMs, containerId,
+                webhookOutcome(helperToken), correlationKey(helperToken));
+    }
+
+    private com.studioquack.sqs.sandbox.helperchan.WebhookIngressOutcome webhookOutcome(String helperToken) {
+        if (helperToken == null) {
+            return null;
+        }
+        return helperRouter.lookup(helperToken).map(HelperJob::webhookOutcome).orElse(null);
+    }
+
+    private String correlationKey(String helperToken) {
+        if (helperToken == null) {
+            return null;
+        }
+        return helperRouter.lookup(helperToken).map(HelperJob::correlationKey).orElse(null);
     }
 
     private static String failureDetail(String base, String stderr, String stdout) {

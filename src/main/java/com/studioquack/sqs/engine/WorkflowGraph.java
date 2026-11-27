@@ -2,6 +2,8 @@ package com.studioquack.sqs.engine;
 
 import com.studioquack.common.dto.flow.EdgeDto;
 import com.studioquack.common.dto.flow.NodeDto;
+import com.studioquack.common.dto.flow.SelectOptionParser;
+import com.studioquack.common.dto.flow.SelectOptionRole;
 
 import java.util.List;
 
@@ -89,6 +91,7 @@ public record WorkflowGraph(
             return false;
         }
         return nodes.stream().anyMatch(n -> n.getData() != null
-                && "start".equalsIgnoreCase(n.getData().getNodeType()));
+                && ("start".equalsIgnoreCase(n.getData().getNodeType())
+                        || SelectOptionParser.resolveActiveRole(n.getData()) == SelectOptionRole.LISTEN));
     }
 }

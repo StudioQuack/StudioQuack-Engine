@@ -9,8 +9,11 @@
 #   if studioquack.isCancelled():
 #       ...
 import base64 as _sq_b64
+import hashlib as _sq_hashlib
+import hmac as _sq_hmac
 import json as _sq_json
 import os as _sq_os
+import re as _sq_re
 import sys as _sq_sys
 import urllib.error as _sq_urlerr
 import urllib.request as _sq_url
@@ -1149,6 +1152,151 @@ class StudioQuackHelper:
             body["correlationKey"] = correlationKey
         _sq_post_json("/v1/helper/message", body)
 
+    # ---- provider webhook ingress & send_and_wait helpers ----
+    def isWebhookInvocation(self):
+        """True when invoked by an inbound webhook on the node's webhook_key."""
+        mode = self.getExecutionContext().get("invocationMode")
+        return isinstance(mode, str) and mode.strip().lower() == "ingress"
+
+    def getWebhookRequest(self):
+        """Returns {method, path, query, queryMulti, headers, rawBody, rawBodyBase64, rawBodyEncoding, body} or None."""
+        if not self.isWebhookInvocation():
+            return None
+        req = self.getExecutionContext().get("webhookRequest")
+        if not isinstance(req, dict):
+            return None
+        out = dict(req)
+        raw_headers = out.get("headers")
+        if isinstance(raw_headers, dict):
+            out["headers"] = {str(k).strip().lower(): v for k, v in raw_headers.items() if k is not None}
+        else:
+            out["headers"] = {}
+        return out
+
+    def getWebhookHeader(self, name, default=None):
+        """Case-insensitive lookup of an inbound webhook HTTP header."""
+        if not name or not isinstance(name, str):
+            return default
+        req = self.getWebhookRequest()
+        if not req:
+            return default
+        headers = req.get("headers") or {}
+        return headers.get(name.strip().lower(), default)
+
+    def getWebhookPayload(self, path=None, default=None):
+        """Read parsed webhook body (JSON or form-urlencoded) or navigate dot/bracket paths like 'value[0].resourceData'."""
+        req = self.getWebhookRequest()
+        if not req:
+            return default
+        payload = req.get("body")
+        if payload is None:
+            raw_body = req.get("rawBody")
+            if isinstance(raw_body, str) and raw_body.strip():
+                ct = str(self.getWebhookHeader("content-type", "") or "").lower()
+                if "application/x-www-form-urlencoded" in ct:
+                    parsed_qs = _sq_urlparse.parse_qs(raw_body, keep_blank_values=True)
+                    payload = {k: (v[0] if len(v) == 1 else v) for k, v in parsed_qs.items()}
+                elif "json" in ct or raw_body.lstrip().startswith(("{", "[")):
+                    try:
+                        payload = _sq_json.loads(raw_body)
+                    except Exception:
+                        payload = None
+        if path is None or str(path).strip() == "":
+            return default if payload is None else payload
+        return _sq_resolve_payload_path(payload, str(path), default)
+
+    def verifyHmacSha256(self, secret, signatureHeader, prefix="sha256=", payloadOverride=None):
+        """Constant-time HMAC-SHA256 verification against exact rawBody bytes (or payloadOverride). Never logs secrets."""
+        if secret is None or not signatureHeader:
+            return False
+        secret_bytes = secret if isinstance(secret, (bytes, bytearray)) else str(secret).encode("utf-8")
+        if not secret_bytes:
+            return False
+        header_val = self.getWebhookHeader(str(signatureHeader))
+        candidate = str(header_val if header_val is not None else signatureHeader).strip()
+        pfx = "" if prefix is None else str(prefix)
+        if pfx:
+            if not candidate.startswith(pfx):
+                return False
+            candidate = candidate[len(pfx):].strip()
+        if not candidate:
+            return False
+        if payloadOverride is not None:
+            msg_bytes = (bytes(payloadOverride) if isinstance(payloadOverride, (bytes, bytearray))
+                         else str(payloadOverride).encode("utf-8"))
+        else:
+            req = self.getWebhookRequest() or {}
+            b64 = req.get("rawBodyBase64")
+            if isinstance(b64, str) and b64:
+                try:
+                    msg_bytes = _sq_b64.b64decode(b64)
+                except Exception:
+                    return False
+            else:
+                raw = req.get("rawBody")
+                msg_bytes = "" if raw is None else str(raw)
+                msg_bytes = msg_bytes.encode("utf-8")
+        expected = _sq_hmac.new(secret_bytes, msg_bytes, _sq_hashlib.sha256).hexdigest().lower()
+        return _sq_hmac.compare_digest(expected, candidate.lower())
+
+    def respondWebhookChallenge(self, body, status=200, contentType="text/plain", *, content_type=None):
+        """Send an immediate verification handshake reply and end invocation cleanly."""
+        ct = content_type if content_type is not None else contentType
+        payload = {
+            "status": int(status) if status is not None else 200,
+            "contentType": str(ct or "text/plain"),
+            "body": "" if body is None else str(body),
+        }
+        _sq_deliver_webhook_event("webhook_challenge", "/v1/helper/webhook-challenge", payload)
+        if _SQ_STATEFUL_RUNNER:
+            return {"ok": True, **payload}
+        _sq_sys.exit(0)
+
+    def emitWebhookEvents(self, events):
+        """Emit 1..100 normalized inbound webhook events [{idempotencyKey?, correlationKey?, payload}] to the engine."""
+        if events is None:
+            raw_list = []
+        elif isinstance(events, dict):
+            raw_list = [events]
+        elif isinstance(events, (list, tuple)):
+            raw_list = list(events)
+        else:
+            raise TypeError("emitWebhookEvents expects a list of event dicts")
+        normalised = []
+        for item in raw_list[:100]:
+            if not isinstance(item, dict):
+                continue
+            ev = {}
+            idem = item.get("idempotencyKey") if "idempotencyKey" in item else item.get("idempotency_key")
+            corr = item.get("correlationKey") if "correlationKey" in item else item.get("correlation_key")
+            if idem is not None and str(idem).strip():
+                ev["idempotencyKey"] = str(idem).strip()
+            if corr is not None and str(corr).strip():
+                ev["correlationKey"] = str(corr).strip()
+            ev["payload"] = item.get("payload") if "payload" in item else {}
+            normalised.append(ev)
+        _sq_deliver_webhook_event("webhook_events", "/v1/helper/webhook-events", {"events": normalised})
+        return {"ok": True, "count": len(normalised)}
+
+    def rejectWebhook(self, status=401, reason="unauthorized"):
+        """Reject an unauthorized/invalid webhook cleanly (no quota charge) and end invocation."""
+        payload = {
+            "status": int(status) if status is not None else 401,
+            "reason": str(reason or "unauthorized"),
+        }
+        _sq_deliver_webhook_event("webhook_reject", "/v1/helper/webhook-reject", payload)
+        if _SQ_STATEFUL_RUNNER:
+            return {"ok": True, **payload}
+        _sq_sys.exit(0)
+
+    def setCorrelationKey(self, key):
+        """Record the Phase-1 send_and_wait correlation key that will wake the parked reply catch."""
+        trimmed = "" if key is None else str(key).strip()
+        if not trimmed:
+            raise ValueError("correlationKey is required")
+        _sq_deliver_webhook_event("correlation_key", "/v1/helper/correlation-key", {"correlationKey": trimmed})
+        return trimmed
+
     def isCancelled(self):
         """True after SIGTERM, a cancel for the current request, or GET /v1/helper/cancelled."""
         _sq_ensure_sigterm()
@@ -1275,6 +1423,33 @@ class StudioQuackHelper:
     def send_message(self, messageName, correlationKey=None):
         return self.sendMessage(messageName, correlationKey=correlationKey)
 
+    def is_webhook_invocation(self):
+        return self.isWebhookInvocation()
+
+    def get_webhook_request(self):
+        return self.getWebhookRequest()
+
+    def get_webhook_header(self, name, default=None):
+        return self.getWebhookHeader(name, default=default)
+
+    def get_webhook_payload(self, path=None, default=None):
+        return self.getWebhookPayload(path=path, default=default)
+
+    def verify_hmac_sha256(self, secret, signature_header, prefix="sha256=", payload_override=None):
+        return self.verifyHmacSha256(secret, signature_header, prefix=prefix, payloadOverride=payload_override)
+
+    def respond_webhook_challenge(self, body, status=200, content_type="text/plain"):
+        return self.respondWebhookChallenge(body, status=status, content_type=content_type)
+
+    def emit_webhook_events(self, events):
+        return self.emitWebhookEvents(events)
+
+    def reject_webhook(self, status=401, reason="unauthorized"):
+        return self.rejectWebhook(status=status, reason=reason)
+
+    def set_correlation_key(self, key):
+        return self.setCorrelationKey(key)
+
     # ---- camelCase twins of the short accessors (same names as the JS/TS and Java helpers) ----
     def fullContext(self):
         return self.getExecutionContext()
@@ -1331,6 +1506,45 @@ def _post_helper_channel_result(items):
             wire.append({"port": str(it.get("port") or it.get("portValue") or ""),
                          "value": str(it.get("value") or it.get("result") or "")})
     _sq_post_json("/v1/helper/result", {"ok": True, "items": wire})
+
+
+def _sq_deliver_webhook_event(kind, path, body):
+    """POST to helper channel when available; otherwise emit sqEvent::: stdout marker fallback."""
+    reply = _sq_post_json(path, body)
+    if reply is not None:
+        return reply
+    marker = dict(body or {})
+    marker["kind"] = kind
+    _sq_sys.stdout.write("sqEvent:::" + _sq_json.dumps(marker, ensure_ascii=False, default=str) + "\n")
+    _sq_sys.stdout.flush()
+    return {"ok": True, "deferred": True}
+
+
+_SQ_PATH_TOKEN_RE = _sq_re.compile(r'([^.\[\]]+)|\[(\d+)\]|\[(?:"([^"]*)"|\'([^\']*)\')\]')
+
+
+def _sq_resolve_payload_path(obj, path, default=None):
+    if obj is None:
+        return default
+    current = obj
+    tokens = list(_SQ_PATH_TOKEN_RE.finditer(path))
+    if not tokens:
+        return default
+    for m in tokens:
+        prop, idx, dq, sq = m.groups()
+        if idx is not None:
+            i = int(idx)
+            if isinstance(current, (list, tuple)) and 0 <= i < len(current):
+                current = current[i]
+            else:
+                return default
+        else:
+            key = prop if prop is not None else (dq if dq is not None else sq)
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                return default
+    return current
 
 
 studioquack = StudioQuackHelper(execution_context=_sq_ctx)

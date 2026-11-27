@@ -72,9 +72,21 @@ public class ActivitiMessageCatchStrategy implements ActivitiFlowNodeStrategy {
 
     @Override
     public GeneratedNode create(BpmnModel model, Process process, NodeDto node, String nodeLabel) {
-        String messageId = registry.getOrCreateMessage(model, node.getData().findParameterValueByShortCode("name"));
+        String messageName = node.getData().findParameterValueByShortCode("name");
+        return createWithMessageName(model, process, node, nodeLabel, "node_" + node.getId(), messageName);
+    }
+
+    /**
+     * Emits an {@link IntermediateCatchEvent} (plus optional {@code EventGateway → [catch, timer]}
+     * timeout synthesis when {@code timeoutMs > 0}) bound to {@code messageName} under
+     * {@code catchElementId}. Shared by standard {@code message.intermediate.catch.event} and
+     * parameter-driven {@code MESSAGE_CATCH} / {@code SEND_AND_WAIT} nodes.
+     */
+    public GeneratedNode createWithMessageName(BpmnModel model, Process process, NodeDto node,
+                                               String nodeLabel, String catchElementId, String messageName) {
+        String messageId = registry.getOrCreateMessage(model, messageName);
         IntermediateCatchEvent catchEvent = new IntermediateCatchEvent();
-        catchEvent.setId("node_" + node.getId());
+        catchEvent.setId(catchElementId);
         catchEvent.setName(nodeLabel);
         MessageEventDefinition def = new MessageEventDefinition();
         def.setMessageRef(messageId);

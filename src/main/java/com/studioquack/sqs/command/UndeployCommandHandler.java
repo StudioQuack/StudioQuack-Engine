@@ -36,6 +36,14 @@ public class UndeployCommandHandler implements DaemonCommandHandler {
     private final DeployedArtifactStore artifactStore;
     private final ClientFileStore clientFileStore;
 
+    /** Null in slice tests that construct this handler by hand. */
+    private com.studioquack.sqs.webhook.DeployedWebhookBindingStore webhookBindingStore;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setWebhookBindingStore(com.studioquack.sqs.webhook.DeployedWebhookBindingStore webhookBindingStore) {
+        this.webhookBindingStore = webhookBindingStore;
+    }
+
     @Override
     public String type() {
         return TYPE;
@@ -72,6 +80,9 @@ public class UndeployCommandHandler implements DaemonCommandHandler {
 
             long[] removed = artifactStore.deleteArtifacts(workflowId);
             long files = clientFileStore.deleteScope(ClientFileStore.SCOPE_DEPLOY, workflowId);
+            if (webhookBindingStore != null) {
+                webhookBindingStore.deleteForWorkflow(workflowId);
+            }
 
             UndeployResult result = new UndeployResult(workflowId, deploymentId, deploymentId != null,
                     removed[0] > 0, removed[1], removed[2], files);

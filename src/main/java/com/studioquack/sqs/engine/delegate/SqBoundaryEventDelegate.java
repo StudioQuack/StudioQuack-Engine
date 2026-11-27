@@ -106,6 +106,15 @@ public class SqBoundaryEventDelegate implements ExecutionListener {
             return;
         }
 
+        // An INGRESS_NODE MESSAGE boundary has its typed ingress output payload sealed by
+        // MessageCorrelationService before the boundary fires — do not overwrite it with generic
+        // metadata-only BoundaryEventVariables.
+        if (cfg.isIngressNodeSource() && hasPreSealedIngressPayload(ctx, ref, hostNodeId, cfg.getId(), handlerEdge.getTarget())) {
+            log.debug("sqBoundaryEventDelegate: preserving pre-sealed ingress payload for boundary={} host={} handler={}",
+                    cfg.getId(), hostNodeId, handlerEdge.getTarget());
+            return;
+        }
+
         Map<String, Object> payload = BoundaryEventVariables.payload(cfg, hostNodeId,
                 execution.getProcessInstanceBusinessKey(),
                 asString(execution.getVariable(EngineVariableNames.ERROR_CODE)),
@@ -239,5 +248,23 @@ public class SqBoundaryEventDelegate implements ExecutionListener {
 
     private String asString(Object value) {
         return value == null ? null : StringUtils.trimToNull(String.valueOf(value));
+    }
+
+    private boolean hasPreSealedIngressPayload(ExecutionContext ctx, ProcessContextRef ref,
+                                               String hostNodeId, String boundaryId, String handlerNodeId) {
+        try {
+            List<InOutValueDto> existing = contextStore.loadInputsTargetingNode(ref, handlerNodeId);
+            if (existing == null || existing.isEmpty()) {
+                return false;
+            }
+            for (InOutValueDto row : existing) {
+                if (row != null && hostNodeId.equals(row.getNodeId()) && boundaryId.equals(row.getPortValue())) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+            return false;
+        }
+        return false;
     }
 }

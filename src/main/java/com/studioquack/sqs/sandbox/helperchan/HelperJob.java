@@ -50,6 +50,11 @@ public final class HelperJob {
     private volatile HelperResult result;
     private volatile HelperFailure failure;
     private volatile Map<String, Object> transformedContext;
+    private volatile WebhookIngressOutcome.WebhookChallenge webhookChallenge;
+    private volatile WebhookIngressOutcome.WebhookReject webhookReject;
+    private final List<WebhookIngressOutcome.WebhookEmittedEvent> webhookEvents =
+            Collections.synchronizedList(new ArrayList<>());
+    private volatile String correlationKey;
     private final List<Map<String, Object>> metrics = Collections.synchronizedList(new ArrayList<>());
     private final List<Map<String, Object>> logs = Collections.synchronizedList(new ArrayList<>());
     private final List<Map<String, Object>> dispatch = Collections.synchronizedList(new ArrayList<>());
@@ -125,6 +130,57 @@ public final class HelperJob {
 
     public Map<String, Object> transformedContext() { return transformedContext; }
     public void setTransformedContext(Map<String, Object> c) { this.transformedContext = c; }
+
+    public WebhookIngressOutcome.WebhookChallenge webhookChallenge() { return webhookChallenge; }
+    public void setWebhookChallenge(WebhookIngressOutcome.WebhookChallenge c) { this.webhookChallenge = c; }
+
+    public WebhookIngressOutcome.WebhookReject webhookReject() { return webhookReject; }
+    public void setWebhookReject(WebhookIngressOutcome.WebhookReject r) { this.webhookReject = r; }
+
+    public List<WebhookIngressOutcome.WebhookEmittedEvent> webhookEvents() {
+        synchronized (webhookEvents) {
+            return List.copyOf(webhookEvents);
+        }
+    }
+
+    /**
+     * Appends emitted webhook events up to {@link WebhookIngressOutcome#MAX_EVENTS}.
+     *
+     * @return number of events accepted from {@code incoming}
+     */
+    public int appendWebhookEvents(List<WebhookIngressOutcome.WebhookEmittedEvent> incoming) {
+        if (incoming == null || incoming.isEmpty()) {
+            return 0;
+        }
+        int accepted = 0;
+        synchronized (webhookEvents) {
+            for (WebhookIngressOutcome.WebhookEmittedEvent ev : incoming) {
+                if (webhookEvents.size() >= WebhookIngressOutcome.MAX_EVENTS) {
+                    break;
+                }
+                if (ev != null) {
+                    webhookEvents.add(ev);
+                    accepted++;
+                }
+            }
+        }
+        return accepted;
+    }
+
+    /** Snapshot of recorded webhook ingress results, or {@code null} when none were reported. */
+    public WebhookIngressOutcome webhookOutcome() {
+        WebhookIngressOutcome.WebhookChallenge c = webhookChallenge;
+        WebhookIngressOutcome.WebhookReject r = webhookReject;
+        List<WebhookIngressOutcome.WebhookEmittedEvent> evs = webhookEvents();
+        if (c == null && r == null && evs.isEmpty()) {
+            return null;
+        }
+        return new WebhookIngressOutcome(c, r, evs);
+    }
+
+    /** Correlation key emitted during Phase 1 of {@code send_and_wait}, or {@code null}. */
+    public String correlationKey() { return correlationKey; }
+    public void setCorrelationKey(String correlationKey) { this.correlationKey = correlationKey; }
 
     public List<Map<String, Object>> metrics() { return metrics; }
     public List<Map<String, Object>> logs() { return logs; }

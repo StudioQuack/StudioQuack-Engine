@@ -33,7 +33,8 @@ public final class SecurityTelemetryAccumulator {
             "ingress_auth",
             "ingress_body",
             "sandbox_egress_degraded",
-            "local_auth_fail"
+            "local_auth_fail",
+            "webhook_key_auth"
     );
 
     private final ConcurrentHashMap<String, AtomicLong> counts = new ConcurrentHashMap<>();
