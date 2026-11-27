@@ -14,6 +14,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -24,8 +25,9 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Deletes local database execution history older than an instant (or within a range) in bounded
- * per-batch transactions, purging only runs whose instances have all terminated before the cutoff.
+ * Deletes local database execution history older than an instant in bounded per-batch transactions:
+ * cancels aged dead-lettered failures, purges terminated / runtime-less zombie runs and orphaned
+ * history-less logs, and sweeps leftover {@code ACT_HI_*} history without touching active runs.
  */
 @Slf4j
 @Service
@@ -83,10 +85,11 @@ public class H2LogRetentionService implements ExecutionHistoryPurgeService {
     }
 
     private PurgeResult deleteKeysetBatched(Instant from, Instant to, ProgressListener progress) {
-        long totalExecDeleted = 0L;
-        long totalSandboxDeleted = 0L;
-        long totalActivitiDeleted = 0L;
-        long totalRunsAffected = 0L;
+        Totals totals = new Totals();
+
+        if (from == null) {
+            purgeAgedDeadLetterHeldRuns(to, totals, progress);
+        }
 
         String cursor = null;
         while (true) {
@@ -96,26 +99,105 @@ public class H2LogRetentionService implements ExecutionHistoryPurgeService {
                 break;
             }
             cursor = batch.get(batch.size() - 1);
-
             BatchCounts counts = executeInBatchTransaction(() -> purgeRunBatch(batch));
-            totalExecDeleted += counts.execRows();
-            totalSandboxDeleted += counts.sandboxRows();
-            totalActivitiDeleted += counts.activitiRows();
-            totalRunsAffected += batch.size();
+            totals.add(counts, batch.size());
+            notifyProgress(progress, totals);
+        }
 
-            if (progress != null) {
-                progress.onBatchCommitted(totalExecDeleted, totalRunsAffected, totalSandboxDeleted, totalActivitiDeleted);
-            }
+        if (from == null) {
+            purgeOrphanedLogRuns(to, totals, progress);
+            purgeNullRunIdLogs(to, totals);
         }
 
         if (from == null && activitiHistoryRetentionRepository != null) {
-            totalActivitiDeleted += purgeOrphanedActivitiHistory(to);
+            long orphanAct = purgeOrphanedActivitiHistory(to);
+            totals.activitiRows += orphanAct;
+            if (orphanAct > 0L) {
+                notifyProgress(progress, totals);
+            }
         }
 
         log.info("log-delete[h2 range=[{},{}]]: purged {} execution_context + {} sandbox_log + {} ACT_HI_PROCINST "
-                        + "row(s) across {} terminated run(s)",
-                from, to, totalExecDeleted, totalSandboxDeleted, totalActivitiDeleted, totalRunsAffected);
-        return new PurgeResult(totalExecDeleted, totalRunsAffected, totalSandboxDeleted, totalActivitiDeleted);
+                        + "row(s) across {} run(s)",
+                from, to, totals.execRows, totals.sandboxRows, totals.activitiRows, totals.runs);
+        return totals.toResult();
+    }
+
+    private void purgeAgedDeadLetterHeldRuns(Instant olderThan, Totals totals, ProgressListener progress) {
+        for (int pass = 0; pass < 500; pass++) {
+            List<TerminatedRunQuerySupport.HeldFailedRun> held =
+                    TerminatedRunQuerySupport.findAgedDeadLetterHeldRuns(jdbcTemplate, olderThan, DELETE_BATCH);
+            if (held.isEmpty()) {
+                break;
+            }
+            List<String> cancelledBusinessKeys = new ArrayList<>();
+            List<String> cancelledKeylessPids = new ArrayList<>();
+            int cancelledCount = 0;
+            for (TerminatedRunQuerySupport.HeldFailedRun h : held) {
+                try {
+                    sqsEngine.deleteProcessInstance(h.processInstanceId(), "log-delete");
+                    cancelledCount++;
+                    if (h.businessKey() != null && !h.businessKey().isBlank()) {
+                        cancelledBusinessKeys.add(h.businessKey());
+                    } else {
+                        cancelledKeylessPids.add(h.processInstanceId());
+                    }
+                } catch (RuntimeException ex) {
+                    log.warn("log-delete[h2]: could not cancel dead-lettered pi={} key={}: {}",
+                            h.processInstanceId(), h.businessKey(), ex.toString());
+                }
+            }
+            if (cancelledCount == 0) {
+                break;
+            }
+            if (!cancelledBusinessKeys.isEmpty()) {
+                List<String> uniqueKeys = new ArrayList<>(new LinkedHashSet<>(cancelledBusinessKeys));
+                BatchCounts counts = executeInBatchTransaction(() -> purgeRunBatch(uniqueKeys));
+                totals.add(counts, uniqueKeys.size());
+                notifyProgress(progress, totals);
+            }
+            if (!cancelledKeylessPids.isEmpty() && activitiHistoryRetentionRepository != null) {
+                long actDeleted = executeInBatchTransaction(
+                        () -> (long) activitiHistoryRetentionRepository.deleteByProcessInstanceIds(cancelledKeylessPids));
+                totals.activitiRows += actDeleted;
+                notifyProgress(progress, totals);
+            }
+            if (held.size() < DELETE_BATCH) {
+                break;
+            }
+        }
+    }
+
+    private void purgeOrphanedLogRuns(Instant olderThan, Totals totals, ProgressListener progress) {
+        String cursor = null;
+        while (true) {
+            List<String> batch = TerminatedRunQuerySupport.nextOrphanedLogRunBatch(
+                    jdbcTemplate, olderThan, cursor, DELETE_BATCH);
+            if (batch.isEmpty()) {
+                break;
+            }
+            cursor = batch.get(batch.size() - 1);
+            BatchCounts counts = executeInBatchTransaction(() -> purgeRunBatch(batch));
+            totals.add(counts, batch.size());
+            notifyProgress(progress, totals);
+        }
+    }
+
+    private void purgeNullRunIdLogs(Instant olderThan, Totals totals) {
+        Timestamp cutoff = Timestamp.from(olderThan);
+        try {
+            BatchCounts counts = executeInBatchTransaction(() -> {
+                long ec = jdbcTemplate.update(
+                        "DELETE FROM execution_context WHERE workflow_execution_id IS NULL AND cdate < ?", cutoff);
+                long sl = jdbcTemplate.update(
+                        "DELETE FROM sandbox_log WHERE workflow_execution_id IS NULL AND cdate < ?", cutoff);
+                return new BatchCounts(ec, sl, 0L);
+            });
+            totals.execRows += counts.execRows();
+            totals.sandboxRows += counts.sandboxRows();
+        } catch (RuntimeException ex) {
+            log.debug("log-delete[h2]: null-run-id cleanup skipped: {}", ex.toString());
+        }
     }
 
     private PurgeResult deleteViaRepositoryFallback(Instant olderThan, ProgressListener progress) {
@@ -142,25 +224,17 @@ public class H2LogRetentionService implements ExecutionHistoryPurgeService {
             return new PurgeResult(0L, 0L, 0L, 0L);
         }
 
-        long totalExecDeleted = 0L;
-        long totalSandboxDeleted = 0L;
-        long totalActivitiDeleted = 0L;
-        long totalRunsAffected = 0L;
+        Totals totals = new Totals();
         for (int i = 0; i < purgeableRuns.size(); i += DELETE_BATCH) {
             List<String> batch = purgeableRuns.subList(i, Math.min(i + DELETE_BATCH, purgeableRuns.size()));
             BatchCounts counts = executeInBatchTransaction(() -> purgeRunBatch(batch));
-            totalExecDeleted += counts.execRows();
-            totalSandboxDeleted += counts.sandboxRows();
-            totalActivitiDeleted += counts.activitiRows();
-            totalRunsAffected += batch.size();
-            if (progress != null) {
-                progress.onBatchCommitted(totalExecDeleted, totalRunsAffected, totalSandboxDeleted, totalActivitiDeleted);
-            }
+            totals.add(counts, batch.size());
+            notifyProgress(progress, totals);
         }
         log.info("log-delete[olderThan={}]: purged {} execution_context row(s) + {} sandbox_log row(s) "
                         + "+ {} ACT_HI_PROCINST row(s) across {} terminated run(s)",
-                olderThan, totalExecDeleted, totalSandboxDeleted, totalActivitiDeleted, totalRunsAffected);
-        return new PurgeResult(totalExecDeleted, totalRunsAffected, totalSandboxDeleted, totalActivitiDeleted);
+                olderThan, totals.execRows, totals.sandboxRows, totals.activitiRows, totals.runs);
+        return totals.toResult();
     }
 
     private BatchCounts purgeRunBatch(List<String> batch) {
@@ -177,13 +251,13 @@ public class H2LogRetentionService implements ExecutionHistoryPurgeService {
 
     private long purgeOrphanedActivitiHistory(Instant olderThan) {
         long totalDeleted = 0L;
-        java.sql.Timestamp cutoffTs = java.sql.Timestamp.from(olderThan);
+        Timestamp cutoffTs = Timestamp.from(olderThan);
         for (int pass = 0; pass < 500; pass++) {
             List<String> orphanKeys;
             try {
                 orphanKeys = activitiHistoryRetentionRepository.findOrphanedHistoryBusinessKeys(cutoffTs, DELETE_BATCH);
             } catch (RuntimeException ex) {
-                log.debug("log-delete[h2]: orphaned ACT_HI lookup skipped: {}", ex.toString());
+                log.warn("log-delete[h2]: orphaned ACT_HI lookup skipped: {}", ex.toString());
                 break;
             }
             if (orphanKeys == null || orphanKeys.isEmpty()) {
@@ -262,6 +336,30 @@ public class H2LogRetentionService implements ExecutionHistoryPurgeService {
         }
     }
 
+    private static void notifyProgress(ProgressListener progress, Totals totals) {
+        if (progress != null) {
+            progress.onBatchCommitted(totals.execRows, totals.runs, totals.sandboxRows, totals.activitiRows);
+        }
+    }
+
     private record BatchCounts(long execRows, long sandboxRows, long activitiRows) {
+    }
+
+    private static final class Totals {
+        long execRows;
+        long sandboxRows;
+        long activitiRows;
+        long runs;
+
+        void add(BatchCounts c, int batchRuns) {
+            execRows += c.execRows();
+            sandboxRows += c.sandboxRows();
+            activitiRows += c.activitiRows();
+            runs += batchRuns;
+        }
+
+        PurgeResult toResult() {
+            return new PurgeResult(execRows, runs, sandboxRows, activitiRows);
+        }
     }
 }

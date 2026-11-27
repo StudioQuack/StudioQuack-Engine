@@ -10,38 +10,71 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Keyset-paginated, DB-agnostic JDBC queries for selecting fully-terminated workflow runs
- * ({@code BUSINESS_KEY_} == {@code workflowExecutionId}) within a time window {@code [from, to)}.
+ * Keyset-paginated, DB-agnostic JDBC queries for selecting purge-eligible workflow runs before a
+ * cutoff instant while guaranteeing live/running/waiting workflows are NEVER touched.
  *
- * <p>Replaces the per-run N+1 Activiti query loop so multi-hundred-GB databases with millions of
- * runs can be purged or streamed in constant memory ({@code batchSize} run ids per page) without
- * scanning unindexed tables or holding monolithic transactions.
- *
- * <p>Safety invariants preserved identically to {@code SqsEngine.allInstancesTerminatedBefore}:
- * <ul>
- *   <li>Positive terminal evidence: at least one finished {@code ACT_HI_PROCINST} row exists.</li>
- *   <li>No live/parked instance: zero {@code ACT_HI_PROCINST} rows with {@code END_TIME_ IS NULL}.</li>
- *   <li>Strict upper bound: zero {@code ACT_HI_PROCINST} rows with {@code END_TIME_ >= to}.</li>
- *   <li>Live parent protection: a finished function-port sub-PI whose parent run is still live or
- *       ended at/after {@code to} is excluded so its parent never loses child history mid-run.</li>
- * </ul>
+ * <p>Covers all three categories of non-live log data that accumulate on an engine:
+ * <ol>
+ *   <li><b>Dead-letter-held failed runs</b> ({@link #findAgedDeadLetterHeldRuns}): root workflows
+ *       that failed and parked at {@code hold_<nodeId>} on {@code ACT_RU_DEADLETTER_JOB} with no
+ *       active executable job, timer, user task, or message catch and no activity at/after
+ *       {@code olderThan}. Monitoring already treats these as {@code FAILED}.</li>
+ *   <li><b>Terminated / zombie-history runs</b> ({@link #nextTerminatedRunBatch}): runs whose
+ *       {@code ACT_HI_PROCINST} rows all finished strictly before {@code to} (or have
+ *       {@code END_TIME_ IS NULL} with zero matching {@code ACT_RU_EXECUTION} runtime rows),
+ *       excluding any child sub-PI whose parent still has live runtime or post-cutoff end.</li>
+ *   <li><b>Orphaned / history-less log runs</b> ({@link #nextOrphanedLogRunBatch}): rows in
+ *       {@code execution_context} or {@code sandbox_log} created before {@code olderThan} whose
+ *       {@code workflow_execution_id} has no {@code ACT_HI_PROCINST} row and no live
+ *       {@code ACT_RU_EXECUTION} row (e.g. startup failures or trial runs).</li>
+ * </ol>
  */
 @Slf4j
 public final class TerminatedRunQuerySupport {
+
+    /** One dead-letter-held failed process instance eligible to be cancelled and purged. */
+    public record HeldFailedRun(String processInstanceId, String businessKey) {
+    }
 
     private TerminatedRunQuerySupport() {
     }
 
     /**
-     * Returns the next keyset page of terminated run ids ({@code BUSINESS_KEY_}) ordered ascending.
-     *
-     * @param jdbc             JDBC template for the daemon database (H2 or PostgreSQL)
-     * @param from             optional inclusive lower bound on run {@code END_TIME_} (null = unbounded)
-     * @param to               required exclusive upper bound on run {@code END_TIME_}
-     * @param afterBusinessKey previous page's last key for keyset pagination (null on first page)
-     * @param batchSize        maximum run ids to return (clamped to {@code >= 1})
-     * @param onlyWithLogs     when true, returns only runs that still have rows in
-     *                         {@code execution_context} or {@code sandbox_log}
+     * Finds aged FAILED runs parked solely on {@code ACT_RU_DEADLETTER_JOB} before {@code olderThan}
+     * (no active executable job, timer, user task, or event subscription, and no log row at/after
+     * {@code olderThan}).
+     */
+    public static List<HeldFailedRun> findAgedDeadLetterHeldRuns(JdbcTemplate jdbc, Instant olderThan, int batchSize) {
+        if (jdbc == null || olderThan == null) {
+            return List.of();
+        }
+        int limit = Math.max(1, batchSize);
+        Timestamp cutoff = Timestamp.from(olderThan);
+        String sql = "SELECT p.PROC_INST_ID_, p.BUSINESS_KEY_ FROM ACT_HI_PROCINST p "
+                + "WHERE p.END_TIME_ IS NULL "
+                + "AND p.START_TIME_ < ? "
+                + "AND EXISTS (SELECT 1 FROM ACT_RU_DEADLETTER_JOB d WHERE d.PROCESS_INSTANCE_ID_ = p.PROC_INST_ID_) "
+                + "AND NOT EXISTS (SELECT 1 FROM ACT_RU_JOB j WHERE j.PROCESS_INSTANCE_ID_ = p.PROC_INST_ID_) "
+                + "AND NOT EXISTS (SELECT 1 FROM ACT_RU_TIMER_JOB t WHERE t.PROCESS_INSTANCE_ID_ = p.PROC_INST_ID_) "
+                + "AND NOT EXISTS (SELECT 1 FROM ACT_RU_TASK tk WHERE tk.PROC_INST_ID_ = p.PROC_INST_ID_) "
+                + "AND NOT EXISTS (SELECT 1 FROM ACT_RU_EVENT_SUBSCR es WHERE es.PROC_INST_ID_ = p.PROC_INST_ID_) "
+                + "AND (p.BUSINESS_KEY_ IS NULL OR NOT EXISTS ("
+                + "  SELECT 1 FROM execution_context ec WHERE ec.workflow_execution_id = p.BUSINESS_KEY_ AND ec.cdate >= ?)) "
+                + "AND (p.BUSINESS_KEY_ IS NULL OR NOT EXISTS ("
+                + "  SELECT 1 FROM sandbox_log sl WHERE sl.workflow_execution_id = p.BUSINESS_KEY_ AND sl.cdate >= ?)) "
+                + "ORDER BY p.PROC_INST_ID_ ASC LIMIT ?";
+        try {
+            return jdbc.query(sql, (rs, idx) -> new HeldFailedRun(rs.getString(1), rs.getString(2)),
+                    cutoff, cutoff, cutoff, limit);
+        } catch (DataAccessException ex) {
+            log.debug("dead-letter held-run lookup skipped: {}", ex.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Returns the next keyset page of terminated (or runtime-less zombie) run ids
+     * ({@code BUSINESS_KEY_}) ordered ascending.
      */
     public static List<String> nextTerminatedRunBatch(JdbcTemplate jdbc,
                                                       Instant from,
@@ -56,8 +89,6 @@ public final class TerminatedRunQuerySupport {
         try {
             return queryBatch(jdbc, from, to, afterBusinessKey, limit, onlyWithLogs, true);
         } catch (DataAccessException ex) {
-            // Minimal slice tests may omit sub_pi_invocation or sandbox_log; retry without the
-            // sub-PI parent guard if that table is absent while preserving the core ACT_HI guard.
             if (isMissingRelation(ex)) {
                 log.debug("terminated-run query retrying without optional satellite tables: {}", ex.getMessage());
                 return queryBatch(jdbc, from, to, afterBusinessKey, limit, false, false);
@@ -67,30 +98,49 @@ public final class TerminatedRunQuerySupport {
     }
 
     /**
-     * Counts distinct unfinished (running/parked) runs started before {@code to} (and on/after
-     * {@code from} when provided), so operators see why active runs were excluded from an archive.
+     * Returns the next keyset page of {@code workflow_execution_id}s present in
+     * {@code execution_context} or {@code sandbox_log} strictly before {@code olderThan} that have
+     * NO {@code ACT_HI_PROCINST} row and NO live {@code ACT_RU_EXECUTION} row.
      */
-    public static long countActiveRunsInWindow(JdbcTemplate jdbc, Instant from, Instant to) {
-        if (jdbc == null || to == null) {
-            return 0L;
+    public static List<String> nextOrphanedLogRunBatch(JdbcTemplate jdbc,
+                                                       Instant olderThan,
+                                                       String afterRunId,
+                                                       int batchSize) {
+        if (jdbc == null || olderThan == null) {
+            return List.of();
         }
-        StringBuilder sql = new StringBuilder(
-                "SELECT COUNT(DISTINCT p.BUSINESS_KEY_) FROM ACT_HI_PROCINST p "
-                        + "WHERE p.BUSINESS_KEY_ IS NOT NULL "
-                        + "AND p.END_TIME_ IS NULL "
-                        + "AND p.START_TIME_ < ?");
-        List<Object> params = new ArrayList<>(2);
-        params.add(Timestamp.from(to));
-        if (from != null) {
-            sql.append(" AND p.START_TIME_ >= ?");
-            params.add(Timestamp.from(from));
+        int limit = Math.max(1, batchSize);
+        Timestamp cutoff = Timestamp.from(olderThan);
+        StringBuilder sql = new StringBuilder();
+        List<Object> params = new ArrayList<>(8);
+
+        sql.append("SELECT run_id FROM ( ");
+        sql.append("  SELECT DISTINCT workflow_execution_id AS run_id FROM execution_context ");
+        sql.append("  WHERE workflow_execution_id IS NOT NULL AND cdate < ? ");
+        params.add(cutoff);
+        sql.append("  UNION ");
+        sql.append("  SELECT DISTINCT workflow_execution_id AS run_id FROM sandbox_log ");
+        sql.append("  WHERE workflow_execution_id IS NOT NULL AND cdate < ? ");
+        params.add(cutoff);
+        sql.append(") cand WHERE 1=1 ");
+        if (afterRunId != null && !afterRunId.isEmpty()) {
+            sql.append("AND cand.run_id > ? ");
+            params.add(afterRunId);
         }
+        sql.append("AND NOT EXISTS (SELECT 1 FROM execution_context ec2 WHERE ec2.workflow_execution_id = cand.run_id AND ec2.cdate >= ?) ");
+        params.add(cutoff);
+        sql.append("AND NOT EXISTS (SELECT 1 FROM sandbox_log sl2 WHERE sl2.workflow_execution_id = cand.run_id AND sl2.cdate >= ?) ");
+        params.add(cutoff);
+        sql.append("AND NOT EXISTS (SELECT 1 FROM ACT_HI_PROCINST p WHERE p.BUSINESS_KEY_ = cand.run_id) ");
+        sql.append("AND NOT EXISTS (SELECT 1 FROM ACT_RU_EXECUTION ru WHERE ru.BUSINESS_KEY_ = cand.run_id) ");
+        sql.append("ORDER BY cand.run_id ASC LIMIT ?");
+        params.add(limit);
+
         try {
-            Long count = jdbc.queryForObject(sql.toString(), Long.class, params.toArray());
-            return count == null ? 0L : count;
+            return jdbc.queryForList(sql.toString(), String.class, params.toArray());
         } catch (DataAccessException ex) {
-            log.debug("active-run count skipped: {}", ex.getMessage());
-            return 0L;
+            log.debug("orphaned-log run lookup skipped: {}", ex.getMessage());
+            return List.of();
         }
     }
 
@@ -102,35 +152,41 @@ public final class TerminatedRunQuerySupport {
                                            boolean onlyWithLogs,
                                            boolean guardSubPiParent) {
         StringBuilder sql = new StringBuilder();
-        List<Object> params = new ArrayList<>(6);
+        List<Object> params = new ArrayList<>(10);
         Timestamp toTs = Timestamp.from(to);
 
         sql.append("SELECT DISTINCT p.BUSINESS_KEY_ FROM ACT_HI_PROCINST p ");
         sql.append("WHERE p.BUSINESS_KEY_ IS NOT NULL ");
-        sql.append("AND p.END_TIME_ IS NOT NULL ");
-        sql.append("AND p.END_TIME_ < ? ");
-        params.add(toTs);
-
         if (from != null) {
-            sql.append("AND p.END_TIME_ >= ? ");
+            sql.append("AND p.END_TIME_ IS NOT NULL AND p.END_TIME_ >= ? AND p.END_TIME_ < ? ");
             params.add(Timestamp.from(from));
+            params.add(toTs);
+        } else {
+            // Terminated before cutoff OR zombie history row with zero live ACT_RU_EXECUTION.
+            sql.append("AND ((p.END_TIME_ IS NOT NULL AND p.END_TIME_ < ?) ");
+            sql.append("  OR (p.END_TIME_ IS NULL AND p.START_TIME_ < ? ");
+            sql.append("    AND NOT EXISTS (SELECT 1 FROM ACT_RU_EXECUTION ru WHERE ru.PROC_INST_ID_ = p.PROC_INST_ID_))) ");
+            params.add(toTs);
+            params.add(toTs);
         }
         if (afterBusinessKey != null && !afterBusinessKey.isEmpty()) {
             sql.append("AND p.BUSINESS_KEY_ > ? ");
             params.add(afterBusinessKey);
         }
-        // Terminated-instance guard: zero unfinished instances and zero instances ending at/after cutoff.
+        // Terminated-instance guard: zero live runtime executions and zero instances ending at/after cutoff.
         sql.append("AND NOT EXISTS (SELECT 1 FROM ACT_HI_PROCINST q ");
         sql.append("WHERE q.BUSINESS_KEY_ = p.BUSINESS_KEY_ ");
-        sql.append("AND (q.END_TIME_ IS NULL OR q.END_TIME_ >= ?)) ");
+        sql.append("AND ((q.END_TIME_ IS NOT NULL AND q.END_TIME_ >= ?) ");
+        sql.append("  OR (q.END_TIME_ IS NULL AND EXISTS (SELECT 1 FROM ACT_RU_EXECUTION ru2 WHERE ru2.PROC_INST_ID_ = q.PROC_INST_ID_)))) ");
         params.add(toTs);
 
         if (guardSubPiParent) {
-            // Never purge/archive a child sub-PI while its parent run is still live or post-cutoff.
+            // Protect child sub-PI while its parent still has live runtime or ended at/after cutoff.
             sql.append("AND NOT EXISTS (SELECT 1 FROM sub_pi_invocation spi ");
             sql.append("JOIN ACT_HI_PROCINST parent ON parent.BUSINESS_KEY_ = spi.parent_execution_id ");
             sql.append("WHERE spi.child_execution_id = p.BUSINESS_KEY_ ");
-            sql.append("AND (parent.END_TIME_ IS NULL OR parent.END_TIME_ >= ?)) ");
+            sql.append("AND ((parent.END_TIME_ IS NOT NULL AND parent.END_TIME_ >= ?) ");
+            sql.append("  OR (parent.END_TIME_ IS NULL AND EXISTS (SELECT 1 FROM ACT_RU_EXECUTION pru WHERE pru.PROC_INST_ID_ = parent.PROC_INST_ID_)))) ");
             params.add(toTs);
         }
         if (onlyWithLogs) {
