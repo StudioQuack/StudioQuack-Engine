@@ -22,7 +22,9 @@ import java.time.OffsetDateTime;
         // Retention candidate selection: distinct runs with any row older than the cutoff.
         @Index(name = "idx_sandbox_log_run_cdate", columnList = "workflowExecutionId, cdate"),
         // Per-node read (local diagnostics / archive export ordering).
-        @Index(name = "idx_sandbox_log_run_node", columnList = "workflowExecutionId, nodeId")
+        @Index(name = "idx_sandbox_log_run_node", columnList = "workflowExecutionId, nodeId"),
+        // Time-windowed retention / archive export scans without full-table reads.
+        @Index(name = "idx_sandbox_log_cdate", columnList = "cdate")
 })
 @Getter
 @Setter

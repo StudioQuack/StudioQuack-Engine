@@ -41,7 +41,10 @@ import java.time.OffsetDateTime;
         @Index(name = "idx_exec_flow_revision", columnList = "executionId, bpmnFlowNodeId, revision"),
         // Live-row lookup: "given the studioquackRef read off the engine, load the source-of-truth blob".
         @Index(name = "idx_exec_node_ref", columnList = "executionId, nodeRefId"),
-        @Index(name = "idx_exec_ctx_execution", columnList = "executionId")
+        @Index(name = "idx_exec_ctx_execution", columnList = "executionId"),
+        // Retention / log-archive / log-delete: indexed per-run batch delete and time-window scans.
+        @Index(name = "idx_exec_ctx_wf_exec_cdate", columnList = "workflowExecutionId, cdate"),
+        @Index(name = "idx_exec_ctx_cdate", columnList = "cdate")
 })
 @Getter
 @Setter

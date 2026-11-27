@@ -56,6 +56,14 @@ public final class OverlayReverseListener {
      */
     static final String OCI_PREFIX = "/sqvm/v1/oci-images/";
     static final String OCI_SUFFIX = "/blob";
+    /** Streaming log-archive export path served over mTLS when a stream handler is wired. */
+    public static final String LOG_ARCHIVE_STREAM_PATH = "/sqvm/v1/logs/archive-stream";
+
+    /** Optional streaming handler for large binary overlay responses (e.g. on-the-fly archive streams). */
+    @FunctionalInterface
+    public interface OverlayStreamHandler {
+        void handle(HttpExchange exchange) throws IOException;
+    }
 
     /**
      * Wall-clock hint handed to the {@link DispatchExecutor}. Matches the BE's 7-day {@code RESPONSE_TIMEOUT} /
@@ -101,6 +109,7 @@ public final class OverlayReverseListener {
      * once beat-carried {@code overlayReachable} confirmations stop.
      */
     private volatile Runnable inboundTrafficHook;
+    private volatile OverlayStreamHandler logArchiveStreamHandler;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile HttpsServer server;
@@ -140,6 +149,11 @@ public final class OverlayReverseListener {
      */
     public void setInboundTrafficHook(Runnable inboundTrafficHook) {
         this.inboundTrafficHook = inboundTrafficHook;
+    }
+
+    /** Wires the optional on-the-fly archive stream handler (nullable; absent → 404). */
+    public void setLogArchiveStreamHandler(OverlayStreamHandler logArchiveStreamHandler) {
+        this.logArchiveStreamHandler = logArchiveStreamHandler;
     }
 
     /**
@@ -349,6 +363,13 @@ public final class OverlayReverseListener {
                 handleJobs(ex);
             } else if (COMMAND_PATH.equals(path)) {
                 handleCommand(ex);
+            } else if (LOG_ARCHIVE_STREAM_PATH.equals(path)) {
+                OverlayStreamHandler handler = this.logArchiveStreamHandler;
+                if (handler == null) {
+                    writeError(ex, 404, "Error_NotFound", "log archive streaming not available on this engine");
+                } else {
+                    handler.handle(ex);
+                }
             } else if (path.startsWith(OCI_PREFIX) && path.endsWith(OCI_SUFFIX)) {
                 handleOciBlob(ex, path);
             } else {

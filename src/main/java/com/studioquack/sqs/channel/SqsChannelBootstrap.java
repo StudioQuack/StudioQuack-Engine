@@ -113,6 +113,9 @@ public class SqsChannelBootstrap {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private ObjectProvider<ChannelKemIkm> channelKemIkm;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private ObjectProvider<OverlayReverseListener.OverlayStreamHandler> logArchiveStreamHandler;
+
     private volatile HeartbeatClient heartbeatClient;
     private volatile ExecChannelClient execChannelClient;
     private volatile NetHandshakeClient handshakeClient;
@@ -1197,6 +1200,9 @@ public class SqsChannelBootstrap {
             OverlayReverseListener listener = OverlayReverseListener.forMtls(
                     bindHost, port, identity,
                     dispatchExecutor.getIfAvailable(), ociIngest.getIfAvailable(), registry, mapper);
+            if (logArchiveStreamHandler != null) {
+                listener.setLogArchiveStreamHandler(logArchiveStreamHandler.getIfAvailable());
+            }
             listener.setCommandActivityHook(() -> {
                 HeartbeatClient hb = this.heartbeatClient;
                 if (hb != null) {
