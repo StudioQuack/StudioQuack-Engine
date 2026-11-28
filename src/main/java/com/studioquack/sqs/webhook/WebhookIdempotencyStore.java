@@ -1,6 +1,7 @@
 package com.studioquack.sqs.webhook;
 
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.time.Clock;
@@ -27,6 +28,7 @@ public class WebhookIdempotencyStore {
 
     private final Map<String, Long> seenExpiresAt;
 
+    @Autowired
     public WebhookIdempotencyStore() {
         this(DEFAULT_TTL, MAX_ENTRIES, Clock.systemUTC());
     }

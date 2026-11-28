@@ -2,6 +2,8 @@ package com.studioquack.sqs.command;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.studioquack.common.dto.flow.TemplateDto;
+import com.studioquack.common.dto.webhook.EngineApiKeyScope;
+import com.studioquack.common.dto.webhook.WebhookKeyFormat;
 import com.studioquack.sqs.channel.SecurityTelemetryAccumulator;
 import com.studioquack.sqs.channel.config.SqsChannelProperties;
 import com.studioquack.sqs.command.IngestWebhookCommandHandler.IngestWebhookRequest;
@@ -12,6 +14,8 @@ import com.studioquack.sqs.command.MessageCorrelationService.WebhookEventRequest
 import com.studioquack.sqs.sandbox.helperchan.WebhookIngressOutcome;
 import com.studioquack.sqs.secrets.SecretStoreNamespace;
 import com.studioquack.sqs.secrets.os.OsSecretManager;
+import com.studioquack.sqs.webhook.DaemonWebhookKeyEntity;
+import com.studioquack.sqs.webhook.DaemonWebhookKeyRepository;
 import com.studioquack.sqs.webhook.DaemonWebhookKeyStore;
 import com.studioquack.sqs.webhook.DeployedWebhookBindingEntity;
 import com.studioquack.sqs.webhook.DeployedWebhookBindingStore;
@@ -27,14 +31,17 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -47,6 +54,9 @@ class IngestWebhookCommandHandlerTest {
     private static final String KEY_ID = "AbCd1234";
 
     private ObjectMapper mapper;
+    private SqsChannelProperties chProps;
+    private OsSecretManager osSecrets;
+    private SecretStoreNamespace namespace;
     private DaemonWebhookKeyStore keyStore;
     private DeployedWebhookBindingStore bindingStore;
     private WebhookNodeInvoker nodeInvoker;
@@ -72,12 +82,14 @@ class IngestWebhookCommandHandlerTest {
         };
         idempotencyStore = new WebhookIdempotencyStore(Duration.ofHours(24), 1000, clock);
 
-        SqsChannelProperties chProps = new SqsChannelProperties();
+        chProps = new SqsChannelProperties();
+        osSecrets = mock(OsSecretManager.class);
+        namespace = new SecretStoreNamespace(new com.studioquack.sqs.secrets.os.OsSecretManagerProperties(), chProps);
         handler = new IngestWebhookCommandHandler(
                 mapper,
                 chProps,
-                mock(OsSecretManager.class),
-                new SecretStoreNamespace(new com.studioquack.sqs.secrets.os.OsSecretManagerProperties(), chProps),
+                osSecrets,
+                namespace,
                 keyStore,
                 bindingStore,
                 nodeInvoker,
@@ -89,8 +101,8 @@ class IngestWebhookCommandHandlerTest {
 
     @Test
     void invalidSecret_returns401_andRecordsSecurityTelemetry() {
-        when(keyStore.verify(REF_ID, KEY_ID, "URL_KEY", "bad"))
-                .thenReturn(DaemonWebhookKeyStore.VerificationResult.denied("invalid_webhook_secret"));
+        when(keyStore.verify(REF_ID, KEY_ID, "URL_KEY", "bad", EngineApiKeyScope.NODE_SCOPED))
+                .thenReturn(DaemonWebhookKeyStore.VerificationResult.denied("invalid_api_secret"));
 
         IngestWebhookResponse resp = handler.process(request("POST", "bad", "{\"hi\":1}", "application/json"));
 
@@ -102,9 +114,52 @@ class IngestWebhookCommandHandlerTest {
     }
 
     @Test
+    void engineWideKey_rejectedWith401OnNodeScopedWebhookIngest() {
+        Map<String, DaemonWebhookKeyEntity> db = new HashMap<>();
+        DaemonWebhookKeyRepository repo = mock(DaemonWebhookKeyRepository.class);
+        when(repo.existsById(anyString())).thenAnswer(inv -> db.containsKey(inv.getArgument(0)));
+        when(repo.findById(anyString())).thenAnswer(inv -> Optional.ofNullable(db.get(inv.getArgument(0))));
+        when(repo.findByKeyId(anyString())).thenAnswer(inv -> {
+            String keyId = inv.getArgument(0);
+            return db.values().stream().filter(e -> keyId.equals(e.getKeyId())).findFirst();
+        });
+        when(repo.save(any(DaemonWebhookKeyEntity.class))).thenAnswer(inv -> {
+            DaemonWebhookKeyEntity e = inv.getArgument(0);
+            db.put(e.getRefId(), e);
+            return e;
+        });
+
+        DaemonWebhookKeyStore realStore = new DaemonWebhookKeyStore(repo);
+        var engineKey = realStore.create(REF_ID, "Engine Wide Trigger", EngineApiKeyScope.ENGINE_WIDE, false);
+        var parsed = WebhookKeyFormat.parse(engineKey.rawKey()).orElseThrow();
+
+        IngestWebhookCommandHandler handlerWithRealStore = new IngestWebhookCommandHandler(
+                mapper, chProps, osSecrets, namespace, realStore, bindingStore,
+                nodeInvoker, correlationService, idempotencyStore, Runnable::run);
+        handlerWithRealStore.setSecurityTelemetry(telemetry);
+
+        String b64 = Base64.getEncoder().encodeToString("{\"hi\":1}".getBytes(StandardCharsets.UTF_8));
+        IngestWebhookRequest req = new IngestWebhookRequest(
+                "env1", engineKey.refId(), engineKey.keyId(), DaemonWebhookKeyStore.AUTH_MODE_URL_KEY,
+                parsed.secret(), "POST", Map.of(), Map.of("content-type", "application/json"),
+                b64, "application/json", "0123456789abcdef");
+
+        IngestWebhookResponse resp = handlerWithRealStore.process(req);
+
+        assertFalse(resp.secretValid());
+        assertFalse(resp.accepted());
+        assertEquals(401, resp.httpStatus());
+        assertEquals("key_scope_mismatch", resp.rejectionReason());
+        assertEquals(1, telemetry.drain().get("webhook_key_auth"));
+        verify(bindingStore, never()).findByWebhookKeyRef(any());
+        verify(nodeInvoker, never()).invoke(any());
+    }
+
+    @Test
     void handshakeChallenge_shortCircuitsWith200AndZeroMatches() throws Exception {
-        when(keyStore.verify(REF_ID, KEY_ID, "URL_KEY", "good"))
-                .thenReturn(DaemonWebhookKeyStore.VerificationResult.ok(REF_ID, KEY_ID, false));
+        when(keyStore.verify(REF_ID, KEY_ID, "URL_KEY", "good", EngineApiKeyScope.NODE_SCOPED))
+                .thenReturn(DaemonWebhookKeyStore.VerificationResult.ok(
+                        REF_ID, KEY_ID, EngineApiKeyScope.NODE_SCOPED, false));
         when(bindingStore.findByWebhookKeyRef(REF_ID))
                 .thenReturn(List.of(binding("b1", "wf1", "n1", DeployedWebhookBindingStore.KIND_MESSAGE_START,
                         "__sq_hook_wf1_n1", "tpl-1", "hash-1")));
@@ -130,8 +185,9 @@ class IngestWebhookCommandHandlerTest {
 
     @Test
     void badProviderSignature_returns401WithProviderSignatureValidFalse() throws Exception {
-        when(keyStore.verify(REF_ID, KEY_ID, "URL_KEY", "good"))
-                .thenReturn(DaemonWebhookKeyStore.VerificationResult.ok(REF_ID, KEY_ID, false));
+        when(keyStore.verify(REF_ID, KEY_ID, "URL_KEY", "good", EngineApiKeyScope.NODE_SCOPED))
+                .thenReturn(DaemonWebhookKeyStore.VerificationResult.ok(
+                        REF_ID, KEY_ID, EngineApiKeyScope.NODE_SCOPED, false));
         when(bindingStore.findByWebhookKeyRef(REF_ID))
                 .thenReturn(List.of(binding("b1", "wf1", "n1", DeployedWebhookBindingStore.KIND_MESSAGE_START,
                         "__sq_hook_wf1_n1", "tpl-1", "hash-1")));
@@ -153,8 +209,9 @@ class IngestWebhookCommandHandlerTest {
 
     @Test
     void priorityRouting_boundaryBeatsCatchBeatsStart_andDeduplicatesIdenticalParsersAndIdempotency() throws Exception {
-        when(keyStore.verify(REF_ID, KEY_ID, "URL_KEY", "good"))
-                .thenReturn(DaemonWebhookKeyStore.VerificationResult.ok(REF_ID, KEY_ID, false));
+        when(keyStore.verify(REF_ID, KEY_ID, "URL_KEY", "good", EngineApiKeyScope.NODE_SCOPED))
+                .thenReturn(DaemonWebhookKeyStore.VerificationResult.ok(
+                        REF_ID, KEY_ID, EngineApiKeyScope.NODE_SCOPED, false));
 
         // All 3 bindings share the same (templateId, paramsHash) → parser invokes ONCE!
         var bBoundary = binding("b_bnd", "wf1", "n_host", DeployedWebhookBindingStore.KIND_BOUNDARY_MESSAGE,

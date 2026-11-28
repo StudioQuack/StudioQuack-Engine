@@ -3,6 +3,8 @@ package com.studioquack.sqs.command;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.studioquack.common.dto.webhook.EngineApiKeyScope;
+import com.studioquack.common.dto.webhook.WebhookKeyRefHelper;
 import com.studioquack.common.security.envelope.SecureEnvelope;
 import com.studioquack.sqs.channel.EnvelopeClient;
 import com.studioquack.sqs.channel.KemIkmStore;
@@ -21,31 +23,33 @@ import org.springframework.stereotype.Component;
 import java.nio.file.Path;
 
 /**
- * Control-plane-pushed webhook key lifecycle commands ({@code create-webhook-key},
- * {@code rotate-webhook-key}, {@code revoke-webhook-key}).
+ * Control-plane-pushed unified engine API key lifecycle commands
+ * ({@code create-engine-api-key}, {@code rotate-engine-api-key}, {@code revoke-engine-api-key})
+ * covering both {@link EngineApiKeyScope#ENGINE_WIDE} and {@link EngineApiKeyScope#NODE_SCOPED}
+ * keys.
  *
  * <p>Requests arrive sealed in FR-200 {@link SecureEnvelope}s ({@code Direction.BE_TO_AGENT});
- * create and rotate responses return the one-time {@code rawKey} sealed in FR-200
- * {@link SecureEnvelope}s ({@code Direction.AGENT_TO_BE}) so key material is never exposed in
- * plaintext across command transport or result buffers.
+ * create and rotate responses return the one-time {@code rawKey} ({@code sqk_<keyId>_<secret>})
+ * sealed in FR-200 {@link SecureEnvelope}s ({@code Direction.AGENT_TO_BE}) so key material is
+ * never exposed in plaintext across command transport or result buffers.
  */
 @Slf4j
-public final class WebhookKeyCommandHandlers {
+public final class EngineApiKeyCommandHandlers {
 
-    public static final String COMMAND_CREATE = "create-webhook-key";
-    public static final String COMMAND_ROTATE = "rotate-webhook-key";
-    public static final String COMMAND_REVOKE = "revoke-webhook-key";
+    public static final String COMMAND_CREATE = "create-engine-api-key";
+    public static final String COMMAND_ROTATE = "rotate-engine-api-key";
+    public static final String COMMAND_REVOKE = "revoke-engine-api-key";
 
-    public static final String AAD_CREATE = "webhook-key-create";
-    public static final String AAD_ROTATE = "webhook-key-rotate";
-    public static final String AAD_REVOKE = "webhook-key-revoke";
+    public static final String AAD_CREATE = "engine-api-key-create";
+    public static final String AAD_ROTATE = "engine-api-key-rotate";
+    public static final String AAD_REVOKE = "engine-api-key-revoke";
 
-    private WebhookKeyCommandHandlers() {
+    private EngineApiKeyCommandHandlers() {
     }
 
     @Component
     @RequiredArgsConstructor
-    public static class CreateWebhookKeyCommandHandler implements DaemonCommandHandler {
+    public static class CreateEngineApiKeyCommandHandler implements DaemonCommandHandler {
         private final ObjectMapper mapper;
         private final SqsChannelProperties channel;
         private final OsSecretManager osSecrets;
@@ -61,11 +65,17 @@ public final class WebhookKeyCommandHandlers {
         public DaemonCommandOutcome handle(DaemonCommand command) throws Exception {
             EnvelopeClient envelopeClient = buildEnvelopeClient(channel, osSecrets, namespace, mapper);
             CreateRequest req = open(command, AAD_CREATE, CreateRequest.class, mapper, envelopeClient);
-            if (req.refId() == null || req.refId().isBlank()) {
-                return DaemonCommandOutcome.failed("create-webhook-key: refId is required");
+            if (req.refId() == null || !WebhookKeyRefHelper.isValidRefId(req.refId())) {
+                return DaemonCommandOutcome.failed("create-engine-api-key: valid refId is required");
+            }
+            EngineApiKeyScope scope;
+            try {
+                scope = EngineApiKeyScope.fromOrDefault(req.keyScope(), EngineApiKeyScope.NODE_SCOPED);
+            } catch (IllegalArgumentException badScope) {
+                return DaemonCommandOutcome.failed("create-engine-api-key: invalid keyScope");
             }
             DaemonWebhookKeyStore.CreatedKey created =
-                    store.create(req.refId(), req.name(), req.allowKeyIdRoute());
+                    store.create(req.refId(), req.name(), scope, req.allowKeyIdRoute());
             KeyMaterialResponse resp = new KeyMaterialResponse(
                     created.refId(), created.keyId(), created.rawKey());
             SecureEnvelope sealed = envelopeClient.sealJson(AAD_CREATE, resp);
@@ -75,7 +85,7 @@ public final class WebhookKeyCommandHandlers {
 
     @Component
     @RequiredArgsConstructor
-    public static class RotateWebhookKeyCommandHandler implements DaemonCommandHandler {
+    public static class RotateEngineApiKeyCommandHandler implements DaemonCommandHandler {
         private final ObjectMapper mapper;
         private final SqsChannelProperties channel;
         private final OsSecretManager osSecrets;
@@ -91,8 +101,8 @@ public final class WebhookKeyCommandHandlers {
         public DaemonCommandOutcome handle(DaemonCommand command) throws Exception {
             EnvelopeClient envelopeClient = buildEnvelopeClient(channel, osSecrets, namespace, mapper);
             RotateRequest req = open(command, AAD_ROTATE, RotateRequest.class, mapper, envelopeClient);
-            if (req.refId() == null || req.refId().isBlank()) {
-                return DaemonCommandOutcome.failed("rotate-webhook-key: refId is required");
+            if (req.refId() == null || !WebhookKeyRefHelper.isValidRefId(req.refId())) {
+                return DaemonCommandOutcome.failed("rotate-engine-api-key: valid refId is required");
             }
             DaemonWebhookKeyStore.CreatedKey rotated = store.rotate(req.refId(), req.previousKeyId());
             KeyMaterialResponse resp = new KeyMaterialResponse(
@@ -104,7 +114,7 @@ public final class WebhookKeyCommandHandlers {
 
     @Component
     @RequiredArgsConstructor
-    public static class RevokeWebhookKeyCommandHandler implements DaemonCommandHandler {
+    public static class RevokeEngineApiKeyCommandHandler implements DaemonCommandHandler {
         private final ObjectMapper mapper;
         private final SqsChannelProperties channel;
         private final OsSecretManager osSecrets;
@@ -122,7 +132,7 @@ public final class WebhookKeyCommandHandlers {
             RevokeRequest req = open(command, AAD_REVOKE, RevokeRequest.class, mapper, envelopeClient);
             if ((req.refId() == null || req.refId().isBlank())
                     && (req.keyId() == null || req.keyId().isBlank())) {
-                return DaemonCommandOutcome.failed("revoke-webhook-key: refId or keyId is required");
+                return DaemonCommandOutcome.failed("revoke-engine-api-key: refId or keyId is required");
             }
             boolean revoked = store.revoke(req.refId(), req.keyId());
             return DaemonCommandOutcome.ok(mapper.writeValueAsString(new RevokeResponse(revoked)));
@@ -150,7 +160,7 @@ public final class WebhookKeyCommandHandlers {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    record CreateRequest(String refId, String name, boolean allowKeyIdRoute) {
+    record CreateRequest(String refId, String name, String keyScope, boolean allowKeyIdRoute) {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

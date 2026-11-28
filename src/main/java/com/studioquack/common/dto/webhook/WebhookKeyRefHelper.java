@@ -13,13 +13,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
- * Helper for recognizing and extracting {@code {"$webhookKeyRef": "whk_..."}} structured
+ * Helper for recognizing and extracting {@code {"$webhookKeyRef": "<uuid|whk_...>"}} structured
  * parameter placeholders across node configuration parameters and boundary-event ingress
  * bindings.
  *
- * <p>Plaintext webhook keys never appear in workflow documents, deploy payloads, or logs;
+ * <p>Plaintext API/webhook keys never appear in workflow documents, deploy payloads, or logs;
  * only this reference placeholder is persisted.
  */
 public final class WebhookKeyRefHelper {
@@ -30,9 +31,17 @@ public final class WebhookKeyRefHelper {
     /** Parameter type constant for webhook key bindings. */
     public static final String PARAM_TYPE_WEBHOOK_KEY = "webhook_key";
 
+    /** Valid key reference id pattern: accepts UUIDs and {@code whk_...} identifiers. */
+    public static final Pattern REF_ID_PATTERN = Pattern.compile("^[A-Za-z0-9_-]{6,64}$");
+
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private WebhookKeyRefHelper() {
+    }
+
+    /** True when {@code refId} matches the accepted UUID / {@code whk_...} reference id pattern. */
+    public static boolean isValidRefId(String refId) {
+        return refId != null && REF_ID_PATTERN.matcher(refId.trim()).matches();
     }
 
     /** Construct the canonical placeholder map {@code {"$webhookKeyRef": refId}}. */
@@ -43,8 +52,8 @@ public final class WebhookKeyRefHelper {
     }
 
     /**
-     * Extract the {@code whk_...} reference id from a parameter value, accepting either a
-     * deserialized {@link Map} ({@code {"$webhookKeyRef": "whk_..."}}) or a JSON-encoded
+     * Extract a valid key reference id (UUID or {@code whk_...}) from a parameter value, accepting
+     * either a deserialized {@link Map} ({@code {"$webhookKeyRef": "..."}}) or a JSON-encoded
      * string representation of the same object.
      */
     public static Optional<String> extractWebhookKeyRef(Object rawValue) {
@@ -53,7 +62,7 @@ public final class WebhookKeyRefHelper {
         }
         if (rawValue instanceof Map<?, ?> map) {
             Object ref = map.get(REF_FIELD);
-            if (ref instanceof String s && !s.isBlank()) {
+            if (ref instanceof String s && isValidRefId(s)) {
                 return Optional.of(s.trim());
             }
             return Optional.empty();
@@ -64,7 +73,7 @@ public final class WebhookKeyRefHelper {
                 try {
                     JsonNode node = JSON.readTree(text);
                     JsonNode refNode = node.get(REF_FIELD);
-                    if (refNode != null && refNode.isTextual() && !refNode.asText().isBlank()) {
+                    if (refNode != null && refNode.isTextual() && isValidRefId(refNode.asText())) {
                         return Optional.of(refNode.asText().trim());
                     }
                 } catch (Exception ignored) {

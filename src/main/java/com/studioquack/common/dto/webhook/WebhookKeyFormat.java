@@ -7,21 +7,24 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Wire format parser, generator, and validator for engine webhook API keys.
+ * Wire format parser, generator, and validator for unified engine API keys
+ * ({@link EngineApiKeyScope#ENGINE_WIDE} and {@link EngineApiKeyScope#NODE_SCOPED}).
  *
  * <p>Canonical wire format:
  * <pre>{@code
- * sqwh_<8-char-base62-keyId>_<43-char-base64url-256bit-secret>
+ * sqk_<8-char-base62-keyId>_<43-char-base64url-256bit-secret>
  * }</pre>
  *
- * <p>The {@code sqwh_} prefix is structurally disjoint from general engine API keys
- * ({@code sqk_}) so a webhook key can never authenticate on non-webhook endpoints and
- * log/audit scrubbers can reliably redact any {@code sqwh_[A-Za-z0-9_-]+} token.
+ * <p>Legacy {@code sqwh_} wire keys remain tolerated on parse and log/audit scrubbing for
+ * backward safety during migration; all newly minted and rotated keys use {@code sqk_}.
  */
 public final class WebhookKeyFormat {
 
-    /** Wire prefix for provider webhook keys (disjoint from {@code sqk_}). */
-    public static final String WIRE_PREFIX = "sqwh_";
+    /** Canonical wire prefix for unified engine API keys. */
+    public static final String WIRE_PREFIX = "sqk_";
+
+    /** Legacy webhook-only wire prefix tolerated on parse and redaction for backward safety. */
+    public static final String LEGACY_WIRE_PREFIX = "sqwh_";
 
     /** Stable control-plane reference id prefix stored in workflow/node JSON. */
     public static final String REF_ID_PREFIX = "whk_";
@@ -30,14 +33,14 @@ public final class WebhookKeyFormat {
     public static final Pattern KEY_ID_PATTERN = Pattern.compile("^[A-Za-z0-9]{8}$");
 
     /**
-     * Full wire key pattern: {@code sqwh_<8-char-base62>_<base64url-secret>}
+     * Full wire key pattern: {@code (sqk|sqwh)_<8-char-base62>_<base64url-secret>}
      * (secret >= 32 chars; standard 256-bit base64url without padding is 43 chars).
      */
     public static final Pattern FULL_KEY_PATTERN =
-            Pattern.compile("^sqwh_([A-Za-z0-9]{8})_([A-Za-z0-9_-]{32,128})$");
+            Pattern.compile("^(?:sqk|sqwh)_([A-Za-z0-9]{8})_([A-Za-z0-9_-]{32,128})$");
 
     /** Broad scrubbing pattern used by redactors and request log filters. */
-    public static final Pattern REDACT_PATTERN = Pattern.compile("sqwh_[A-Za-z0-9_-]+");
+    public static final Pattern REDACT_PATTERN = Pattern.compile("(?:sqk|sqwh)_[A-Za-z0-9_-]+");
 
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final char[] HEX = "0123456789abcdef".toCharArray();
@@ -49,7 +52,7 @@ public final class WebhookKeyFormat {
     private WebhookKeyFormat() {
     }
 
-    /** Parsed components of a valid {@code sqwh_<keyId>_<secret>} wire token. */
+    /** Parsed components of a valid {@code sqk_<keyId>_<secret>} (or legacy {@code sqwh_}) wire token. */
     public record ParsedWebhookKey(String keyId, String secret) {
     }
 
@@ -65,9 +68,13 @@ public final class WebhookKeyFormat {
         return Optional.of(new ParsedWebhookKey(matcher.group(1), matcher.group(2)));
     }
 
-    /** True when the candidate string starts with the {@code sqwh_} wire prefix. */
+    /** True when the candidate string starts with the {@code sqk_} or legacy {@code sqwh_} wire prefix. */
     public static boolean hasWebhookKeyPrefix(String value) {
-        return value != null && value.trim().startsWith(WIRE_PREFIX);
+        if (value == null) {
+            return false;
+        }
+        String trimmed = value.trim();
+        return trimmed.startsWith(WIRE_PREFIX) || trimmed.startsWith(LEGACY_WIRE_PREFIX);
     }
 
     /** True when the candidate string is a valid non-secret 8-char base62 {@code keyId}. */

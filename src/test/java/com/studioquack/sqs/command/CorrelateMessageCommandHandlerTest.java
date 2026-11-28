@@ -5,11 +5,18 @@ import com.studioquack.common.dto.flow.EdgeDto;
 import com.studioquack.common.dto.flow.NodeDto;
 import com.studioquack.common.dto.flow.ParameterDto;
 import com.studioquack.common.dto.flow.TemplateDto;
+import com.studioquack.common.dto.webhook.EngineApiKeyScope;
+import com.studioquack.common.dto.webhook.WebhookKeyFormat;
+import com.studioquack.common.security.envelope.Direction;
+import com.studioquack.common.security.envelope.EnvelopeCrypto;
+import com.studioquack.common.security.envelope.SecureEnvelope;
+import com.studioquack.sqs.channel.SecurityTelemetryAccumulator;
 import com.studioquack.sqs.channel.command.DaemonCommand;
 import com.studioquack.sqs.channel.command.DaemonCommandOutcome;
 import com.studioquack.sqs.engine.SqsEngine;
 import com.studioquack.sqs.engine.WorkflowDeploymentService;
 import com.studioquack.sqs.engine.WorkflowGraph;
+import com.studioquack.sqs.webhook.DaemonWebhookKeyStore;
 import org.activiti.engine.runtime.Execution;
 import org.activiti.engine.runtime.ProcessInstance;
 import org.junit.jupiter.api.Test;
@@ -18,6 +25,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -30,7 +38,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * The {@code correlate-message} command handler against the embedded Activiti engine on an
- * in-memory database. Proves the reverse-channel message-event correlation seam end-to-end
+ * in-memory database. Proves the reverse-channel message-event correlation seam and inline
+ * daemon-side {@link EngineApiKeyScope#ENGINE_WIDE} API key verification end-to-end.
  */
 @SpringBootTest(properties = {
         "spring.datasource.url=jdbc:h2:mem:sqs-correlate-msg-cmd-test;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE",
@@ -38,11 +47,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         "spring.datasource.username=sa",
         "spring.datasource.password=",
         "spring.flyway.enabled=false",
-        "otel.sdk.disabled=true"
+        "otel.sdk.disabled=true",
+        "sqs.channel.enabled=false",
+        "sqs.channel.env-id=env-correlate",
+        "sqs.channel.bearer=test-correlate-bearer-0123456789abcdef",
+        "sqs.channel.data-dir=${java.io.tmpdir}/sqs-correlate-msg-cmd-test-no-kem",
+        "sqs.secrets.os.enabled=false"
 })
 @ActiveProfiles("base")
 class CorrelateMessageCommandHandlerTest {
 
+    private static final String ENV_ID = "env-correlate";
+    private static final String TEST_BEARER = "test-correlate-bearer-0123456789abcdef";
     private static final String MESSAGE_NAME = "orderApproved";
 
     @Autowired
@@ -51,6 +67,8 @@ class CorrelateMessageCommandHandlerTest {
     private WorkflowDeploymentService deploymentService;
     @Autowired
     private SqsEngine sqsEngine;
+    @Autowired
+    private DaemonWebhookKeyStore webhookKeyStore;
     @Autowired
     private ObjectMapper mapper;
 
@@ -65,7 +83,7 @@ class CorrelateMessageCommandHandlerTest {
 
         // A message with a REF-ONLY (route__) token is correlated to the parked run.
         String payload = mapper.writeValueAsString(Map.of(
-                "envId", "env-correlate",
+                "envId", ENV_ID,
                 "messageName", MESSAGE_NAME,
                 "businessKey", businessKey,
                 "variables", Map.of("route__correlated", "yes")));
@@ -100,7 +118,7 @@ class CorrelateMessageCommandHandlerTest {
 
         // No businessKey field — only correlationKey (they are the same workflowExecutionId).
         String payload = mapper.writeValueAsString(Map.of(
-                "envId", "env-correlate",
+                "envId", ENV_ID,
                 "messageName", MESSAGE_NAME,
                 "correlationKey", businessKey));
         DaemonCommandOutcome outcome = handler.handle(command("c-correlate-alias", payload));
@@ -115,7 +133,7 @@ class CorrelateMessageCommandHandlerTest {
     void no_waiting_execution_returns_ok_not_correlated() throws Exception {
         // A businessKey with no running instance: a benign no-match, reported as ok{correlated:false}.
         String payload = mapper.writeValueAsString(Map.of(
-                "envId", "env-correlate",
+                "envId", ENV_ID,
                 "messageName", MESSAGE_NAME,
                 "businessKey", "no-such-run-" + UUID.randomUUID()));
         DaemonCommandOutcome outcome = handler.handle(command("c-correlate-nomatch", payload));
@@ -134,7 +152,7 @@ class CorrelateMessageCommandHandlerTest {
 
         // Right run, wrong message name: nothing is waiting on this message → no-match.
         String payload = mapper.writeValueAsString(Map.of(
-                "envId", "env-correlate",
+                "envId", ENV_ID,
                 "messageName", "someOtherMessage",
                 "businessKey", businessKey));
         DaemonCommandOutcome outcome = handler.handle(command("c-correlate-wrongmsg", payload));
@@ -153,13 +171,13 @@ class CorrelateMessageCommandHandlerTest {
     void malformed_payload_returns_failed_not_throw() {
         DaemonCommandOutcome outcome = handler.handle(command("c-correlate-bad", "{ not-json"));
         assertFalse(outcome.succeeded(), "malformed payload must fail");
-        assertNotNull(outcome.error(), "failure carries an error message for the BE");
+        assertNotNull(outcome.error(), "failure carries an error message for the control plane");
         assertTrue(outcome.error().startsWith("correlate-message:"), "error is namespaced; got: " + outcome.error());
     }
 
     @Test
     void payload_without_message_name_returns_failed() throws Exception {
-        String payload = mapper.writeValueAsString(Map.of("envId", "env-correlate", "businessKey", "bk-1"));
+        String payload = mapper.writeValueAsString(Map.of("envId", ENV_ID, "businessKey", "bk-1"));
         DaemonCommandOutcome outcome = handler.handle(command("c-correlate-nomsg", payload));
         assertFalse(outcome.succeeded(), "a payload without messageName must fail");
         assertNotNull(outcome.error());
@@ -167,7 +185,7 @@ class CorrelateMessageCommandHandlerTest {
 
     @Test
     void payload_without_correlation_key_returns_failed() throws Exception {
-        String payload = mapper.writeValueAsString(Map.of("envId", "env-correlate", "messageName", MESSAGE_NAME));
+        String payload = mapper.writeValueAsString(Map.of("envId", ENV_ID, "messageName", MESSAGE_NAME));
         DaemonCommandOutcome outcome = handler.handle(command("c-correlate-nokey", payload));
         assertFalse(outcome.succeeded(), "a payload without businessKey/correlationKey must fail");
         assertNotNull(outcome.error());
@@ -180,7 +198,7 @@ class CorrelateMessageCommandHandlerTest {
 
         // A non-whitelisted (PHI-bearing) variable must be rejected before it can reach ACT_*_VARIABLE.
         String payload = mapper.writeValueAsString(Map.of(
-                "envId", "env-correlate",
+                "envId", ENV_ID,
                 "messageName", MESSAGE_NAME,
                 "businessKey", businessKey,
                 "variables", Map.of("patientName", "SECRET-9f3a")));
@@ -198,7 +216,115 @@ class CorrelateMessageCommandHandlerTest {
         assertFalse(varNames.contains("patientName"), "the PHI var never reached the engine; vars=" + varNames);
     }
 
+    @Test
+    void inline_engine_wide_api_key_verifies_and_correlates_parked_message() throws Exception {
+        String refId = WebhookKeyFormat.generateRefId();
+        var created = webhookKeyStore.create(refId, "Engine Wide Key", EngineApiKeyScope.ENGINE_WIDE, false);
+        var parsed = WebhookKeyFormat.parse(created.rawKey()).orElseThrow();
+
+        String businessKey = UUID.randomUUID().toString();
+        ProcessInstance instance = deployAndStartMessageCatchFlow("wfCorrelateEngineKey", businessKey);
+        Execution parked = sqsEngine.findMessageEventExecution(businessKey, MESSAGE_NAME);
+        assertNotNull(parked);
+
+        SecureEnvelope verifyEnv = sealApiKeyVerification(refId, created.keyId(), parsed.secret());
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("envId", ENV_ID);
+        body.put("messageName", MESSAGE_NAME);
+        body.put("businessKey", businessKey);
+        body.put("apiKeyVerification", verifyEnv);
+
+        DaemonCommandOutcome outcome = handler.handle(command("c-correlate-engkey-ok", mapper.writeValueAsString(body)));
+        assertTrue(outcome.succeeded(), () -> "valid ENGINE_WIDE key must correlate: " + outcome.error());
+        Map<?, ?> out = mapper.readValue(outcome.output(), Map.class);
+        assertEquals(Boolean.TRUE, out.get("correlated"));
+        assertEquals(parked.getId(), out.get("executionId"));
+        assertNull(sqsEngine.findMessageEventExecution(businessKey, MESSAGE_NAME));
+        assertTrue(sqsEngine.isProcessInstanceActive(instance.getId()));
+    }
+
+    @Test
+    void inline_node_scoped_api_key_is_rejected_and_leaves_instance_parked() throws Exception {
+        String refId = WebhookKeyFormat.generateRefId();
+        var created = webhookKeyStore.create(refId, "Node Scoped Key", EngineApiKeyScope.NODE_SCOPED, false);
+        var parsed = WebhookKeyFormat.parse(created.rawKey()).orElseThrow();
+
+        String businessKey = UUID.randomUUID().toString();
+        deployAndStartMessageCatchFlow("wfCorrelateNodeKeyDenied", businessKey);
+        assertNotNull(sqsEngine.findMessageEventExecution(businessKey, MESSAGE_NAME));
+
+        SecureEnvelope verifyEnv = sealApiKeyVerification(refId, created.keyId(), parsed.secret());
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("envId", ENV_ID);
+        body.put("messageName", MESSAGE_NAME);
+        body.put("businessKey", businessKey);
+        body.put("apiKeyVerification", verifyEnv);
+
+        SecurityTelemetryAccumulator telemetry = new SecurityTelemetryAccumulator();
+        handler.setSecurityTelemetry(telemetry);
+        try {
+            DaemonCommandOutcome outcome = handler.handle(
+                    command("c-correlate-nodekey-denied", mapper.writeValueAsString(body)));
+            assertFalse(outcome.succeeded(), "NODE_SCOPED key must be rejected on correlate-message");
+            assertEquals(CorrelateMessageCommandHandler.ERROR_INVALID_API_KEY, outcome.error());
+            assertEquals(1, telemetry.drain().get(CorrelateMessageCommandHandler.TELEMETRY_WEBHOOK_KEY_AUTH));
+            assertNotNull(sqsEngine.findMessageEventExecution(businessKey, MESSAGE_NAME),
+                    "parked instance must remain untouched on key rejection");
+        } finally {
+            handler.setSecurityTelemetry(null);
+        }
+    }
+
+    @Test
+    void inline_engine_wide_wrong_secret_and_revoked_key_are_rejected() throws Exception {
+        String refId = WebhookKeyFormat.generateRefId();
+        var created = webhookKeyStore.create(refId, "Revocable Engine Key", EngineApiKeyScope.ENGINE_WIDE, false);
+        var parsed = WebhookKeyFormat.parse(created.rawKey()).orElseThrow();
+
+        String businessKey = UUID.randomUUID().toString();
+        deployAndStartMessageCatchFlow("wfCorrelateBadAndRevokedKey", businessKey);
+        assertNotNull(sqsEngine.findMessageEventExecution(businessKey, MESSAGE_NAME));
+
+        // 1. Wrong secret
+        Map<String, Object> wrongSecretBody = new LinkedHashMap<>();
+        wrongSecretBody.put("envId", ENV_ID);
+        wrongSecretBody.put("messageName", MESSAGE_NAME);
+        wrongSecretBody.put("businessKey", businessKey);
+        wrongSecretBody.put("apiKeyVerification",
+                sealApiKeyVerification(refId, created.keyId(), "wrong_secret_000000000000000000000000000000"));
+        DaemonCommandOutcome badSecretOut = handler.handle(
+                command("c-correlate-bad-secret", mapper.writeValueAsString(wrongSecretBody)));
+        assertFalse(badSecretOut.succeeded());
+        assertEquals(CorrelateMessageCommandHandler.ERROR_INVALID_API_KEY, badSecretOut.error());
+        assertNotNull(sqsEngine.findMessageEventExecution(businessKey, MESSAGE_NAME));
+
+        // 2. Revoked key presenting its previously valid secret
+        assertTrue(webhookKeyStore.revoke(refId, created.keyId()));
+        Map<String, Object> revokedBody = new LinkedHashMap<>();
+        revokedBody.put("envId", ENV_ID);
+        revokedBody.put("messageName", MESSAGE_NAME);
+        revokedBody.put("businessKey", businessKey);
+        revokedBody.put("apiKeyVerification",
+                sealApiKeyVerification(refId, created.keyId(), parsed.secret()));
+        DaemonCommandOutcome revokedOut = handler.handle(
+                command("c-correlate-revoked", mapper.writeValueAsString(revokedBody)));
+        assertFalse(revokedOut.succeeded());
+        assertEquals(CorrelateMessageCommandHandler.ERROR_INVALID_API_KEY, revokedOut.error());
+        assertNotNull(sqsEngine.findMessageEventExecution(businessKey, MESSAGE_NAME));
+    }
+
     // ---- fixtures -------------------------------------------------------
+
+    private SecureEnvelope sealApiKeyVerification(String refId, String keyId, String secret) throws Exception {
+        byte[] ikm = EnvelopeCrypto.ikmFromBearer(TEST_BEARER);
+        return EnvelopeCrypto.sealJson(
+                ikm,
+                Direction.BE_TO_AGENT,
+                ENV_ID,
+                CorrelateMessageCommandHandler.AAD_API_KEY_VERIFY,
+                Map.of("refId", refId, "keyId", keyId, "presentedSecret", secret),
+                mapper);
+    }
 
     /**
      * Deploys {@code start → messageCatch → userTask → end} and starts one instance with

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.studioquack.common.dto.flow.TemplateDto;
+import com.studioquack.common.dto.webhook.EngineApiKeyScope;
 import com.studioquack.common.dto.webhook.WebhookKeyFormat;
 import com.studioquack.sqs.channel.EnvelopeClient;
 import com.studioquack.sqs.channel.SecurityTelemetryAccumulator;
@@ -135,9 +136,9 @@ public class IngestWebhookCommandHandler implements DaemonCommandHandler {
 
     @Override
     public DaemonCommandOutcome handle(DaemonCommand command) throws Exception {
-        EnvelopeClient envelopeClient = WebhookKeyCommandHandlers.buildEnvelopeClient(
+        EnvelopeClient envelopeClient = EngineApiKeyCommandHandlers.buildEnvelopeClient(
                 channel, osSecrets, namespace, mapper);
-        IngestWebhookRequest req = WebhookKeyCommandHandlers.open(
+        IngestWebhookRequest req = EngineApiKeyCommandHandlers.open(
                 command, AAD_TAG, IngestWebhookRequest.class, mapper, envelopeClient);
         IngestWebhookResponse response = process(req);
         return DaemonCommandOutcome.ok(mapper.writeValueAsString(response));
@@ -149,9 +150,10 @@ public class IngestWebhookCommandHandler implements DaemonCommandHandler {
             return IngestWebhookResponse.rejected(false, true, 400, "malformed_request");
         }
 
-        // 1) Local constant-time secret verification against DaemonWebhookKeyStore.
+        // 1) Local constant-time secret verification against DaemonWebhookKeyStore (strictly NODE_SCOPED).
         DaemonWebhookKeyStore.VerificationResult verification = webhookKeyStore.verify(
-                req.refId(), req.keyId(), req.authMode(), req.presentedSecret());
+                req.refId(), req.keyId(), req.authMode(), req.presentedSecret(),
+                EngineApiKeyScope.NODE_SCOPED);
         if (!verification.valid()) {
             if (securityTelemetry != null) {
                 securityTelemetry.record(TELEMETRY_WEBHOOK_KEY_AUTH);

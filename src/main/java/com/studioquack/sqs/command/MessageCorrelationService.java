@@ -52,9 +52,10 @@ import java.util.stream.Collectors;
 
 /**
  * The single, shared realization of client-side message-event correlation onto this env's embedded Activiti
- * engine. Both delivery paths call this ONE service so the correlation logic (and its REF-ONLY safety) is
- * defined exactly once: {@link CorrelateMessageCommandHandler} — the BE-routed reverse-channel
- * {@code correlate-message} command (self-hosted, NAT'd daemon behind the heartbeat).
+ * engine. Both reverse-channel ingress handlers call this ONE service so the correlation logic (and its
+ * REF-ONLY safety) is defined exactly once: {@link CorrelateMessageCommandHandler} (classic
+ * {@code correlate-message}) and {@link IngestWebhookCommandHandler} (parameter-driven
+ * {@code ingest-webhook-key-event}).
  */
 @Slf4j
 @Service
