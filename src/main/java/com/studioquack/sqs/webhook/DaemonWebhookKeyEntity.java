@@ -66,10 +66,6 @@ public class DaemonWebhookKeyEntity {
     @Builder.Default
     private EngineApiKeyScope keyScope = EngineApiKeyScope.NODE_SCOPED;
 
-    /** When {@code true} (and scope is {@code NODE_SCOPED}), permits {@code KEY_ID_ONLY} routing. */
-    @Column(name = "allow_key_id_route", nullable = false)
-    private boolean allowKeyIdRoute;
-
     /** {@link #STATUS_ACTIVE} or {@link #STATUS_REVOKED}. */
     @Column(name = "status", length = 32, nullable = false)
     private String status;

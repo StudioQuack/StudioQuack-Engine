@@ -33,7 +33,6 @@ public class DaemonWebhookKeyStore {
 
     public static final String AUTH_MODE_URL_KEY = "URL_KEY";
     public static final String AUTH_MODE_HEADER_KEY = "HEADER_KEY";
-    public static final String AUTH_MODE_KEY_ID_ONLY = "KEY_ID_ONLY";
 
     private static final int MAX_KEY_ID_ATTEMPTS = 8;
 
@@ -49,40 +48,32 @@ public class DaemonWebhookKeyStore {
             String refId,
             String keyId,
             EngineApiKeyScope keyScope,
-            boolean allowKeyIdRoute,
             String failureReason) {
 
         public static VerificationResult ok(String refId,
                                             String keyId,
-                                            EngineApiKeyScope keyScope,
-                                            boolean allowKeyIdRoute) {
-            return new VerificationResult(true, refId, keyId, keyScope, allowKeyIdRoute, null);
+                                            EngineApiKeyScope keyScope) {
+            return new VerificationResult(true, refId, keyId, keyScope, null);
         }
 
         public static VerificationResult denied(String reason) {
-            return new VerificationResult(false, null, null, null, false, reason);
+            return new VerificationResult(false, null, null, null, reason);
         }
     }
 
     /**
      * Generates a fresh {@code sqk_<8-char-base62>_<43-char-base64url>} engine API key and stores
      * only its non-secret metadata + SHA-256 digest under {@code refId}.
-     *
-     * <p>{@code allowKeyIdRoute} is permitted only for {@link EngineApiKeyScope#NODE_SCOPED} keys;
-     * for {@link EngineApiKeyScope#ENGINE_WIDE} it is forced {@code false}.
      */
     @Transactional
     public CreatedKey create(String refId,
                              String name,
-                             EngineApiKeyScope keyScope,
-                             boolean allowKeyIdRoute) {
+                             EngineApiKeyScope keyScope) {
         String normalizedRefId = requireRefId(refId);
         if (repository.existsById(normalizedRefId)) {
             throw new IllegalStateException("engine API key refId already exists: " + normalizedRefId);
         }
         EngineApiKeyScope resolvedScope = keyScope == null ? EngineApiKeyScope.NODE_SCOPED : keyScope;
-        boolean effectiveAllowKeyIdRoute =
-                resolvedScope == EngineApiKeyScope.NODE_SCOPED && allowKeyIdRoute;
 
         String keyId = allocateUniqueKeyId();
         String secret = WebhookKeyFormat.generateSecret();
@@ -95,22 +86,20 @@ public class DaemonWebhookKeyStore {
                 .secretSha256(digestHex)
                 .name(StringUtils.trimToNull(name))
                 .keyScope(resolvedScope)
-                .allowKeyIdRoute(effectiveAllowKeyIdRoute)
                 .status(DaemonWebhookKeyEntity.STATUS_ACTIVE)
                 .createdAt(now)
                 .build();
         repository.save(entity);
 
-        log.info("engine-api-key.created refId={} keyPrefix={} scope={} allowKeyIdRoute={}",
-                normalizedRefId, WebhookKeyFormat.safeKeyIdPrefix(keyId),
-                resolvedScope, effectiveAllowKeyIdRoute);
+        log.info("engine-api-key.created refId={} keyPrefix={} scope={}",
+                normalizedRefId, WebhookKeyFormat.safeKeyIdPrefix(keyId), resolvedScope);
         return new CreatedKey(normalizedRefId, keyId, WebhookKeyFormat.format(keyId, secret));
     }
 
     /**
      * Atomically replaces the {@code (keyId, secret)} pair for an active {@code refId} while
-     * preserving its {@code keyScope} and {@code allowKeyIdRoute}, so bound workflows keep
-     * referencing the same {@code refId} without re-editing nodes.
+     * preserving its {@code keyScope}, so bound workflows keep referencing the same {@code refId}
+     * without re-editing nodes.
      */
     @Transactional
     public CreatedKey rotate(String refId, String previousKeyId) {
@@ -211,34 +200,13 @@ public class DaemonWebhookKeyStore {
             return VerificationResult.denied("invalid_api_secret");
         }
         return VerificationResult.ok(
-                entity.getRefId(), entity.getKeyId(), entity.effectiveKeyScope(), entity.isAllowKeyIdRoute());
+                entity.getRefId(), entity.getKeyId(), entity.effectiveKeyScope());
     }
 
     /**
-     * Verifies {@code KEY_ID_ONLY} routing (for provider-signature-authenticated webhooks where
-     * only the non-secret {@code keyId} is carried in the URL). Strictly requires
-     * {@code status == ACTIVE && keyScope == NODE_SCOPED && allowKeyIdRoute == true}.
-     */
-    @Transactional(readOnly = true)
-    public VerificationResult verifyKeyIdOnly(String refId, String keyId) {
-        Optional<DaemonWebhookKeyEntity> resolved = resolveAndCheckIdentity(refId, keyId);
-        if (resolved.isEmpty()) {
-            return deniedReasonForIdentity(refId, keyId);
-        }
-        DaemonWebhookKeyEntity entity = resolved.get();
-        if (entity.effectiveKeyScope() != EngineApiKeyScope.NODE_SCOPED) {
-            return VerificationResult.denied("key_scope_mismatch");
-        }
-        if (!entity.isAllowKeyIdRoute()) {
-            return VerificationResult.denied("key_id_route_not_allowed");
-        }
-        return VerificationResult.ok(
-                entity.getRefId(), entity.getKeyId(), EngineApiKeyScope.NODE_SCOPED, true);
-    }
-
-    /**
-     * Dispatches verification by {@code authMode} ({@code URL_KEY}, {@code HEADER_KEY}, or
-     * {@code KEY_ID_ONLY}) while strictly enforcing {@code expectedScope}.
+     * Verifies an inbound API / webhook key presentation ({@code URL_KEY} or {@code HEADER_KEY})
+     * by requiring a valid non-blank {@code presentedSecret} matching the stored SHA-256 digest
+     * in constant time while strictly enforcing {@code expectedScope}.
      */
     @Transactional(readOnly = true)
     public VerificationResult verify(String refId,
@@ -246,12 +214,6 @@ public class DaemonWebhookKeyStore {
                                      String authMode,
                                      String presentedSecret,
                                      EngineApiKeyScope expectedScope) {
-        if (AUTH_MODE_KEY_ID_ONLY.equalsIgnoreCase(StringUtils.trimToEmpty(authMode))) {
-            if (expectedScope != EngineApiKeyScope.NODE_SCOPED) {
-                return VerificationResult.denied("key_scope_mismatch");
-            }
-            return verifyKeyIdOnly(refId, keyId);
-        }
         return verifySecret(refId, keyId, presentedSecret, expectedScope);
     }
 

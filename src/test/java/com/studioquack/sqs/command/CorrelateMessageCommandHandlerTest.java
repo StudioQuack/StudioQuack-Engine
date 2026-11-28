@@ -219,7 +219,7 @@ class CorrelateMessageCommandHandlerTest {
     @Test
     void inline_engine_wide_api_key_verifies_and_correlates_parked_message() throws Exception {
         String refId = WebhookKeyFormat.generateRefId();
-        var created = webhookKeyStore.create(refId, "Engine Wide Key", EngineApiKeyScope.ENGINE_WIDE, false);
+        var created = webhookKeyStore.create(refId, "Engine Wide Key", EngineApiKeyScope.ENGINE_WIDE);
         var parsed = WebhookKeyFormat.parse(created.rawKey()).orElseThrow();
 
         String businessKey = UUID.randomUUID().toString();
@@ -246,7 +246,7 @@ class CorrelateMessageCommandHandlerTest {
     @Test
     void inline_node_scoped_api_key_is_rejected_and_leaves_instance_parked() throws Exception {
         String refId = WebhookKeyFormat.generateRefId();
-        var created = webhookKeyStore.create(refId, "Node Scoped Key", EngineApiKeyScope.NODE_SCOPED, false);
+        var created = webhookKeyStore.create(refId, "Node Scoped Key", EngineApiKeyScope.NODE_SCOPED);
         var parsed = WebhookKeyFormat.parse(created.rawKey()).orElseThrow();
 
         String businessKey = UUID.randomUUID().toString();
@@ -278,7 +278,7 @@ class CorrelateMessageCommandHandlerTest {
     @Test
     void inline_engine_wide_wrong_secret_and_revoked_key_are_rejected() throws Exception {
         String refId = WebhookKeyFormat.generateRefId();
-        var created = webhookKeyStore.create(refId, "Revocable Engine Key", EngineApiKeyScope.ENGINE_WIDE, false);
+        var created = webhookKeyStore.create(refId, "Revocable Engine Key", EngineApiKeyScope.ENGINE_WIDE);
         var parsed = WebhookKeyFormat.parse(created.rawKey()).orElseThrow();
 
         String businessKey = UUID.randomUUID().toString();

@@ -75,7 +75,7 @@ public final class EngineApiKeyCommandHandlers {
                 return DaemonCommandOutcome.failed("create-engine-api-key: invalid keyScope");
             }
             DaemonWebhookKeyStore.CreatedKey created =
-                    store.create(req.refId(), req.name(), scope, req.allowKeyIdRoute());
+                    store.create(req.refId(), req.name(), scope);
             KeyMaterialResponse resp = new KeyMaterialResponse(
                     created.refId(), created.keyId(), created.rawKey());
             SecureEnvelope sealed = envelopeClient.sealJson(AAD_CREATE, resp);
@@ -160,7 +160,7 @@ public final class EngineApiKeyCommandHandlers {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    record CreateRequest(String refId, String name, String keyScope, boolean allowKeyIdRoute) {
+    record CreateRequest(String refId, String name, String keyScope) {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

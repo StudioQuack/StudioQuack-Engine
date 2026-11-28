@@ -130,7 +130,7 @@ class IngestWebhookCommandHandlerTest {
         });
 
         DaemonWebhookKeyStore realStore = new DaemonWebhookKeyStore(repo);
-        var engineKey = realStore.create(REF_ID, "Engine Wide Trigger", EngineApiKeyScope.ENGINE_WIDE, false);
+        var engineKey = realStore.create(REF_ID, "Engine Wide Trigger", EngineApiKeyScope.ENGINE_WIDE);
         var parsed = WebhookKeyFormat.parse(engineKey.rawKey()).orElseThrow();
 
         IngestWebhookCommandHandler handlerWithRealStore = new IngestWebhookCommandHandler(
@@ -159,7 +159,7 @@ class IngestWebhookCommandHandlerTest {
     void handshakeChallenge_shortCircuitsWith200AndZeroMatches() throws Exception {
         when(keyStore.verify(REF_ID, KEY_ID, "URL_KEY", "good", EngineApiKeyScope.NODE_SCOPED))
                 .thenReturn(DaemonWebhookKeyStore.VerificationResult.ok(
-                        REF_ID, KEY_ID, EngineApiKeyScope.NODE_SCOPED, false));
+                        REF_ID, KEY_ID, EngineApiKeyScope.NODE_SCOPED));
         when(bindingStore.findByWebhookKeyRef(REF_ID))
                 .thenReturn(List.of(binding("b1", "wf1", "n1", DeployedWebhookBindingStore.KIND_MESSAGE_START,
                         "__sq_hook_wf1_n1", "tpl-1", "hash-1")));
@@ -187,7 +187,7 @@ class IngestWebhookCommandHandlerTest {
     void badProviderSignature_returns401WithProviderSignatureValidFalse() throws Exception {
         when(keyStore.verify(REF_ID, KEY_ID, "URL_KEY", "good", EngineApiKeyScope.NODE_SCOPED))
                 .thenReturn(DaemonWebhookKeyStore.VerificationResult.ok(
-                        REF_ID, KEY_ID, EngineApiKeyScope.NODE_SCOPED, false));
+                        REF_ID, KEY_ID, EngineApiKeyScope.NODE_SCOPED));
         when(bindingStore.findByWebhookKeyRef(REF_ID))
                 .thenReturn(List.of(binding("b1", "wf1", "n1", DeployedWebhookBindingStore.KIND_MESSAGE_START,
                         "__sq_hook_wf1_n1", "tpl-1", "hash-1")));
@@ -211,7 +211,7 @@ class IngestWebhookCommandHandlerTest {
     void priorityRouting_boundaryBeatsCatchBeatsStart_andDeduplicatesIdenticalParsersAndIdempotency() throws Exception {
         when(keyStore.verify(REF_ID, KEY_ID, "URL_KEY", "good", EngineApiKeyScope.NODE_SCOPED))
                 .thenReturn(DaemonWebhookKeyStore.VerificationResult.ok(
-                        REF_ID, KEY_ID, EngineApiKeyScope.NODE_SCOPED, false));
+                        REF_ID, KEY_ID, EngineApiKeyScope.NODE_SCOPED));
 
         // All 3 bindings share the same (templateId, paramsHash) → parser invokes ONCE!
         var bBoundary = binding("b_bnd", "wf1", "n_host", DeployedWebhookBindingStore.KIND_BOUNDARY_MESSAGE,

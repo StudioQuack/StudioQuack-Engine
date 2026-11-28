@@ -53,7 +53,7 @@ class DaemonWebhookKeyStoreTest {
     @Test
     void createVerifyRotateRevoke_nodeScopedLifecycle() {
         String refId = "whk_0123456789abcdef01234567";
-        var created = store.create(refId, "Inbound Hook", EngineApiKeyScope.NODE_SCOPED, false);
+        var created = store.create(refId, "Inbound Hook", EngineApiKeyScope.NODE_SCOPED);
 
         assertEquals(refId, created.refId());
         assertTrue(WebhookKeyFormat.isValidKeyId(created.keyId()));
@@ -66,16 +66,14 @@ class DaemonWebhookKeyStoreTest {
         DaemonWebhookKeyEntity saved = db.get(refId);
         assertNotNull(saved);
         assertEquals(EngineApiKeyScope.NODE_SCOPED, saved.getKeyScope());
-        assertFalse(saved.isAllowKeyIdRoute());
         assertEquals(64, saved.getSecretSha256().length());
         assertNotEquals(parsed.secret(), saved.getSecretSha256());
 
-        // Valid secret passes URL_KEY and HEADER_KEY under NODE_SCOPED; KEY_ID_ONLY rejected when allowKeyIdRoute=false.
+        // Valid secret passes URL_KEY and HEADER_KEY under NODE_SCOPED; wrong or blank secrets are rejected.
         var urlOk = store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_URL_KEY,
                 parsed.secret(), EngineApiKeyScope.NODE_SCOPED);
         assertTrue(urlOk.valid());
         assertEquals(EngineApiKeyScope.NODE_SCOPED, urlOk.keyScope());
-        assertFalse(urlOk.allowKeyIdRoute());
 
         assertTrue(store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_HEADER_KEY,
                 parsed.secret(), EngineApiKeyScope.NODE_SCOPED).valid());
@@ -87,11 +85,14 @@ class DaemonWebhookKeyStoreTest {
         assertFalse(badSecret.valid());
         assertEquals("invalid_api_secret", badSecret.failureReason());
 
-        var keyIdDisallowed = store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_KEY_ID_ONLY,
+        var missingSecret = store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_URL_KEY,
                 null, EngineApiKeyScope.NODE_SCOPED);
-        assertFalse(keyIdDisallowed.valid());
-        assertEquals("key_id_route_not_allowed", keyIdDisallowed.failureReason());
-        assertFalse(store.verifyKeyIdOnly(refId, created.keyId()).valid());
+        assertFalse(missingSecret.valid());
+        assertEquals("invalid_api_secret", missingSecret.failureReason());
+
+        var blankSecret = store.verifySecret(refId, created.keyId(), "   ", EngineApiKeyScope.NODE_SCOPED);
+        assertFalse(blankSecret.valid());
+        assertEquals("invalid_api_secret", blankSecret.failureReason());
 
         // Rotate atomically updates (keyId, secret) while preserving refId and scope.
         var rotated = store.rotate(refId, created.keyId());
@@ -121,23 +122,26 @@ class DaemonWebhookKeyStoreTest {
     }
 
     @Test
-    void engineWideKey_verifiesUnderEngineWide_rejectsNodeScoped_andForcesAllowKeyIdRouteFalse() {
+    void engineWideKey_verifiesUnderEngineWide_andRejectsNodeScoped() {
         String refId = "whk_aaaa1111bbbb2222cccc3333";
-        // Requesting allowKeyIdRoute=true for ENGINE_WIDE must be forced false.
-        var created = store.create(refId, "Engine Trigger Key", EngineApiKeyScope.ENGINE_WIDE, true);
+        var created = store.create(refId, "Engine Trigger Key", EngineApiKeyScope.ENGINE_WIDE);
         var parsed = WebhookKeyFormat.parse(created.rawKey()).orElseThrow();
 
         DaemonWebhookKeyEntity saved = db.get(refId);
         assertNotNull(saved);
         assertEquals(EngineApiKeyScope.ENGINE_WIDE, saved.getKeyScope());
-        assertFalse(saved.isAllowKeyIdRoute(), "ENGINE_WIDE keys must force allowKeyIdRoute=false");
 
         var okSecret = store.verifySecret(refId, created.keyId(), parsed.secret(), EngineApiKeyScope.ENGINE_WIDE);
         assertTrue(okSecret.valid());
         assertEquals(EngineApiKeyScope.ENGINE_WIDE, okSecret.keyScope());
-        assertFalse(okSecret.allowKeyIdRoute());
         assertTrue(store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_HEADER_KEY,
                 parsed.secret(), EngineApiKeyScope.ENGINE_WIDE).valid());
+
+        // Blank/null secrets are always rejected.
+        var missingSecret = store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_HEADER_KEY,
+                null, EngineApiKeyScope.ENGINE_WIDE);
+        assertFalse(missingSecret.valid());
+        assertEquals("invalid_api_secret", missingSecret.failureReason());
 
         // Rejected under NODE_SCOPED with key_scope_mismatch.
         var wrongScopeDirect = store.verifySecret(refId, created.keyId(), parsed.secret(), EngineApiKeyScope.NODE_SCOPED);
@@ -149,22 +153,7 @@ class DaemonWebhookKeyStoreTest {
         assertFalse(wrongScopeDispatch.valid());
         assertEquals("key_scope_mismatch", wrongScopeDispatch.failureReason());
 
-        // KEY_ID_ONLY is never permitted for ENGINE_WIDE keys.
-        var keyIdDirect = store.verifyKeyIdOnly(refId, created.keyId());
-        assertFalse(keyIdDirect.valid());
-        assertEquals("key_scope_mismatch", keyIdDirect.failureReason());
-
-        var keyIdUnderEngineWide = store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_KEY_ID_ONLY,
-                null, EngineApiKeyScope.ENGINE_WIDE);
-        assertFalse(keyIdUnderEngineWide.valid());
-        assertEquals("key_scope_mismatch", keyIdUnderEngineWide.failureReason());
-
-        var keyIdUnderNodeScoped = store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_KEY_ID_ONLY,
-                null, EngineApiKeyScope.NODE_SCOPED);
-        assertFalse(keyIdUnderNodeScoped.valid());
-        assertEquals("key_scope_mismatch", keyIdUnderNodeScoped.failureReason());
-
-        // Rotate preserves ENGINE_WIDE scope and allowKeyIdRoute=false.
+        // Rotate preserves ENGINE_WIDE scope.
         var rotated = store.rotate(refId, created.keyId());
         var rotatedParsed = WebhookKeyFormat.parse(rotated.rawKey()).orElseThrow();
         assertTrue(store.verifySecret(refId, rotated.keyId(), rotatedParsed.secret(),
@@ -173,24 +162,21 @@ class DaemonWebhookKeyStoreTest {
                 EngineApiKeyScope.NODE_SCOPED);
         assertFalse(rotatedWrongScope.valid());
         assertEquals("key_scope_mismatch", rotatedWrongScope.failureReason());
-        assertFalse(db.get(refId).isAllowKeyIdRoute());
     }
 
     @Test
-    void nodeScopedKey_verifiesUnderNodeScoped_rejectsEngineWide_andSupportsKeyIdOnly() {
+    void nodeScopedKey_verifiesUnderNodeScoped_rejectsEngineWide_andRequiresSecret() {
         String refId = "whk_fedcba9876543210fedcba98";
-        var created = store.create(refId, "Header Delegated Hook", EngineApiKeyScope.NODE_SCOPED, true);
+        var created = store.create(refId, "Header Delegated Hook", EngineApiKeyScope.NODE_SCOPED);
         var parsed = WebhookKeyFormat.parse(created.rawKey()).orElseThrow();
 
         DaemonWebhookKeyEntity saved = db.get(refId);
         assertNotNull(saved);
         assertEquals(EngineApiKeyScope.NODE_SCOPED, saved.getKeyScope());
-        assertTrue(saved.isAllowKeyIdRoute());
 
         var secretOk = store.verifySecret(refId, created.keyId(), parsed.secret(), EngineApiKeyScope.NODE_SCOPED);
         assertTrue(secretOk.valid());
         assertEquals(EngineApiKeyScope.NODE_SCOPED, secretOk.keyScope());
-        assertTrue(secretOk.allowKeyIdRoute());
 
         // Rejected under ENGINE_WIDE with key_scope_mismatch.
         var wrongScopeDirect = store.verifySecret(refId, created.keyId(), parsed.secret(), EngineApiKeyScope.ENGINE_WIDE);
@@ -202,22 +188,16 @@ class DaemonWebhookKeyStoreTest {
         assertFalse(wrongScopeDispatch.valid());
         assertEquals("key_scope_mismatch", wrongScopeDispatch.failureReason());
 
-        // Supports KEY_ID_ONLY when allowKeyIdRoute=true under NODE_SCOPED.
-        var keyIdDirect = store.verifyKeyIdOnly(refId, created.keyId());
-        assertTrue(keyIdDirect.valid());
-        assertEquals(EngineApiKeyScope.NODE_SCOPED, keyIdDirect.keyScope());
-        assertTrue(keyIdDirect.allowKeyIdRoute());
-
-        var keyIdDispatch = store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_KEY_ID_ONLY,
+        // Missing secret is always rejected regardless of authMode.
+        var noSecretNode = store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_HEADER_KEY,
                 null, EngineApiKeyScope.NODE_SCOPED);
-        assertTrue(keyIdDispatch.valid());
-        assertEquals(EngineApiKeyScope.NODE_SCOPED, keyIdDispatch.keyScope());
-        assertTrue(keyIdDispatch.allowKeyIdRoute());
+        assertFalse(noSecretNode.valid());
+        assertEquals("invalid_api_secret", noSecretNode.failureReason());
 
-        var keyIdWrongScope = store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_KEY_ID_ONLY,
+        var noSecretWrongScope = store.verify(refId, created.keyId(), DaemonWebhookKeyStore.AUTH_MODE_HEADER_KEY,
                 null, EngineApiKeyScope.ENGINE_WIDE);
-        assertFalse(keyIdWrongScope.valid());
-        assertEquals("key_scope_mismatch", keyIdWrongScope.failureReason());
+        assertFalse(noSecretWrongScope.valid());
+        assertEquals("key_scope_mismatch", noSecretWrongScope.failureReason());
     }
 
     @Test

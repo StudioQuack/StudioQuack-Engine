@@ -94,11 +94,11 @@ class EngineApiKeyCommandHandlersTest {
 
         String refId = "whk_111122223333444455556666";
 
-        // 1. Create NODE_SCOPED key with allowKeyIdRoute=true
+        // 1. Create NODE_SCOPED key
         DaemonCommand createCmd = sealedCommand("cmd-node-1", EngineApiKeyCommandHandlers.COMMAND_CREATE,
                 EngineApiKeyCommandHandlers.AAD_CREATE,
                 Map.of("refId", refId, "name", "Main Hook",
-                        "keyScope", EngineApiKeyScope.NODE_SCOPED.name(), "allowKeyIdRoute", true));
+                        "keyScope", EngineApiKeyScope.NODE_SCOPED.name()));
         DaemonCommandOutcome createOut = createHandler.handle(createCmd);
         assertTrue(createOut.succeeded());
 
@@ -113,12 +113,11 @@ class EngineApiKeyCommandHandlersTest {
         assertEquals(keyId1, parsed1.keyId());
 
         assertTrue(store.verifySecret(refId, keyId1, parsed1.secret(), EngineApiKeyScope.NODE_SCOPED).valid());
-        assertTrue(store.verifyKeyIdOnly(refId, keyId1).valid());
         var wrongScope1 = store.verifySecret(refId, keyId1, parsed1.secret(), EngineApiKeyScope.ENGINE_WIDE);
         assertFalse(wrongScope1.valid());
         assertEquals("key_scope_mismatch", wrongScope1.failureReason());
 
-        // 2. Rotate NODE_SCOPED key — preserves scope and allowKeyIdRoute
+        // 2. Rotate NODE_SCOPED key — preserves scope
         DaemonCommand rotateCmd = sealedCommand("cmd-node-2", EngineApiKeyCommandHandlers.COMMAND_ROTATE,
                 EngineApiKeyCommandHandlers.AAD_ROTATE,
                 Map.of("refId", refId, "previousKeyId", keyId1));
@@ -138,7 +137,6 @@ class EngineApiKeyCommandHandlersTest {
 
         assertFalse(store.verifySecret(refId, keyId1, parsed1.secret(), EngineApiKeyScope.NODE_SCOPED).valid());
         assertTrue(store.verifySecret(refId, keyId2, parsed2.secret(), EngineApiKeyScope.NODE_SCOPED).valid());
-        assertTrue(store.verifyKeyIdOnly(refId, keyId2).valid());
 
         // 3. Revoke NODE_SCOPED key
         DaemonCommand revokeCmd = sealedCommand("cmd-node-3", EngineApiKeyCommandHandlers.COMMAND_REVOKE,
@@ -158,11 +156,11 @@ class EngineApiKeyCommandHandlersTest {
     void engineWide_createRotateRevoke_roundTripThroughFr200SecureEnvelopes() throws Exception {
         String refId = "whk_aaaa2222bbbb3333cccc4444";
 
-        // 1. Create ENGINE_WIDE key (allowKeyIdRoute=true must be coerced to false)
+        // 1. Create ENGINE_WIDE key
         DaemonCommand createCmd = sealedCommand("cmd-eng-1", EngineApiKeyCommandHandlers.COMMAND_CREATE,
                 EngineApiKeyCommandHandlers.AAD_CREATE,
                 Map.of("refId", refId, "name", "Engine Message Trigger",
-                        "keyScope", EngineApiKeyScope.ENGINE_WIDE.name(), "allowKeyIdRoute", true));
+                        "keyScope", EngineApiKeyScope.ENGINE_WIDE.name()));
         DaemonCommandOutcome createOut = createHandler.handle(createCmd);
         assertTrue(createOut.succeeded());
 
@@ -177,12 +175,10 @@ class EngineApiKeyCommandHandlersTest {
         assertEquals(keyId1, parsed1.keyId());
 
         assertEquals(EngineApiKeyScope.ENGINE_WIDE, db.get(refId).getKeyScope());
-        assertFalse(db.get(refId).isAllowKeyIdRoute());
         assertTrue(store.verifySecret(refId, keyId1, parsed1.secret(), EngineApiKeyScope.ENGINE_WIDE).valid());
         var wrongScope = store.verifySecret(refId, keyId1, parsed1.secret(), EngineApiKeyScope.NODE_SCOPED);
         assertFalse(wrongScope.valid());
         assertEquals("key_scope_mismatch", wrongScope.failureReason());
-        assertFalse(store.verifyKeyIdOnly(refId, keyId1).valid());
 
         // 2. Rotate ENGINE_WIDE key — preserves ENGINE_WIDE scope
         DaemonCommand rotateCmd = sealedCommand("cmd-eng-2", EngineApiKeyCommandHandlers.COMMAND_ROTATE,
@@ -222,7 +218,7 @@ class EngineApiKeyCommandHandlersTest {
         DaemonCommand badScopeCmd = sealedCommand("cmd-bad-scope", EngineApiKeyCommandHandlers.COMMAND_CREATE,
                 EngineApiKeyCommandHandlers.AAD_CREATE,
                 Map.of("refId", "whk_999988887777666655554444", "name", "Bad Scope",
-                        "keyScope", "INVALID_SCOPE", "allowKeyIdRoute", false));
+                        "keyScope", "INVALID_SCOPE"));
         DaemonCommandOutcome badOut = createHandler.handle(badScopeCmd);
         assertFalse(badOut.succeeded());
         assertTrue(badOut.error().contains("invalid keyScope"), "unexpected error: " + badOut.error());
@@ -230,7 +226,7 @@ class EngineApiKeyCommandHandlersTest {
         String defaultRefId = "whk_777766665555444433332222";
         DaemonCommand defaultScopeCmd = sealedCommand("cmd-default-scope", EngineApiKeyCommandHandlers.COMMAND_CREATE,
                 EngineApiKeyCommandHandlers.AAD_CREATE,
-                Map.of("refId", defaultRefId, "name", "Default Scope", "allowKeyIdRoute", false));
+                Map.of("refId", defaultRefId, "name", "Default Scope"));
         DaemonCommandOutcome defaultOut = createHandler.handle(defaultScopeCmd);
         assertTrue(defaultOut.succeeded());
         assertEquals(EngineApiKeyScope.NODE_SCOPED, db.get(defaultRefId).getKeyScope());

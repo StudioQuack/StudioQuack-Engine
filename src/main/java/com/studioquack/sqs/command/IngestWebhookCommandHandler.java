@@ -51,7 +51,7 @@ import java.util.concurrent.Executors;
  *   <li>Opens the FR-200 {@code SecureEnvelope} ({@code Direction.BE_TO_AGENT}, AAD
  *       {@code "webhook-key-ingest"}).</li>
  *   <li>Verifies {@code presentedSecret} in constant time against {@link DaemonWebhookKeyStore}
- *       (or permits {@code KEY_ID_ONLY} iff {@code allowKeyIdRoute == true}).</li>
+ *       under {@link EngineApiKeyScope#NODE_SCOPED}.</li>
  *   <li>Resolves active bindings from {@link DeployedWebhookBindingStore} and deduplicates
  *       identical {@code (templateId, paramsHash)} parser invocations across shared-key bindings.</li>
  *   <li>Executes each bound node's own code in {@code invocationMode = "ingress"} via
