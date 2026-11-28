@@ -190,6 +190,12 @@ public class IngestWebhookCommandHandler implements DaemonCommandHandler {
         boolean anyEventsAccepted = false;
         WebhookIngressOutcome.WebhookReject lastRejection = null;
 
+        // Collect all emitted (binding, event) pairs across EVERY parser group first so that
+        // idempotency deduplication and BOUNDARY > CATCH/SEND_AND_WAIT > START priority routing
+        // apply globally across all bindings sharing this webhook key (even when bindings have
+        // different roles/paramsHash).
+        Map<String, List<BindingEventCandidate>> logicalEventsByKey = new LinkedHashMap<>();
+
         for (List<DeployedWebhookBindingEntity> group : groups.values()) {
             DeployedWebhookBindingEntity representative = group.get(0);
             TemplateDto template = parseTemplate(representative.getTargetNodeJson());
@@ -237,27 +243,44 @@ public class IngestWebhookCommandHandler implements DaemonCommandHandler {
                 continue;
             }
 
-            // 5) Correlate emitted events with 24h TTL idempotency dedup and priority routing:
-            //    BOUNDARY_MESSAGE > SEND_AND_WAIT / MESSAGE_CATCH > MESSAGE_START.
             List<WebhookIngressOutcome.WebhookEmittedEvent> events = outcome.events();
             if (events == null || events.isEmpty()) {
                 continue;
             }
             anyEventsAccepted = true;
-            for (WebhookIngressOutcome.WebhookEmittedEvent event : events) {
+            for (int i = 0; i < events.size(); i++) {
+                WebhookIngressOutcome.WebhookEmittedEvent event = events.get(i);
                 if (event == null) {
                     continue;
                 }
-                if (firstIdempotencyKey == null && StringUtils.isNotBlank(event.idempotencyKey())) {
-                    firstIdempotencyKey = event.idempotencyKey().trim();
+                String idem = StringUtils.trimToNull(event.idempotencyKey());
+                if (firstIdempotencyKey == null && idem != null) {
+                    firstIdempotencyKey = idem;
                 }
-                if (!idempotencyStore.recordIfNew(verifiedRefId, event.idempotencyKey())) {
-                    log.info("webhook-ingest.duplicate refId={} idempotencyKey={}",
-                            verifiedRefId, event.idempotencyKey());
-                    continue;
+                String slotKey = idem != null ? "idem:" + idem : "idx:" + i;
+                List<BindingEventCandidate> bucket =
+                        logicalEventsByKey.computeIfAbsent(slotKey, k -> new ArrayList<>());
+                for (DeployedWebhookBindingEntity b : group) {
+                    bucket.add(new BindingEventCandidate(b, event));
                 }
-                totalMatched += routeEventByPriority(group, event);
             }
+        }
+
+        // 5) Deduplicate each logical event ONCE globally for verifiedRefId, then route across
+        //    all candidate bindings in strict priority order:
+        //    BOUNDARY_MESSAGE > SEND_AND_WAIT / MESSAGE_CATCH > MESSAGE_START.
+        for (Map.Entry<String, List<BindingEventCandidate>> entry : logicalEventsByKey.entrySet()) {
+            List<BindingEventCandidate> candidates = entry.getValue();
+            if (candidates.isEmpty()) {
+                continue;
+            }
+            String idem = entry.getKey().startsWith("idem:")
+                    ? entry.getKey().substring("idem:".length()) : null;
+            if (idem != null && !idempotencyStore.recordIfNew(verifiedRefId, idem)) {
+                log.info("webhook-ingest.duplicate refId={} idempotencyKey={}", verifiedRefId, idem);
+                continue;
+            }
+            totalMatched += routeCandidatesByPriority(candidates);
         }
 
         if (!anyEventsAccepted && lastRejection != null) {
@@ -267,42 +290,50 @@ public class IngestWebhookCommandHandler implements DaemonCommandHandler {
 
         return new IngestWebhookResponse(
                 true, false, true, true,
-                200, "application/json", "{\"accepted\":true}",
+                200, "application/json", "{\"accepted\":true,\"matchedCount\":" + totalMatched + "}",
                 firstIdempotencyKey, totalMatched, null);
     }
 
+    private record BindingEventCandidate(
+            DeployedWebhookBindingEntity binding,
+            WebhookIngressOutcome.WebhookEmittedEvent event) {
+    }
+
     /**
-     * Routes one emitted event across the group's bindings in strict priority order:
+     * Routes one logical event across ALL candidate bindings sharing this webhook key in strict
+     * global priority order:
      * <ol>
      *   <li>Waiting {@code BOUNDARY_MESSAGE} bindings matching {@code (messageName, correlationKey)}</li>
      *   <li>Waiting {@code SEND_AND_WAIT} and {@code MESSAGE_CATCH} bindings matching {@code (messageName, correlationKey)}</li>
      *   <li>{@code MESSAGE_START} bindings (dispatched asynchronously on virtual threads)</li>
      * </ol>
      */
-    private int routeEventByPriority(List<DeployedWebhookBindingEntity> group,
-                                     WebhookIngressOutcome.WebhookEmittedEvent event) {
-        List<DeployedWebhookBindingEntity> boundaries = new ArrayList<>();
-        List<DeployedWebhookBindingEntity> catches = new ArrayList<>();
-        List<DeployedWebhookBindingEntity> starts = new ArrayList<>();
-        for (DeployedWebhookBindingEntity b : group) {
-            String kind = StringUtils.trimToEmpty(b.getBindingKind());
+    private int routeCandidatesByPriority(List<BindingEventCandidate> candidates) {
+        List<BindingEventCandidate> boundaries = new ArrayList<>();
+        List<BindingEventCandidate> catches = new ArrayList<>();
+        List<BindingEventCandidate> starts = new ArrayList<>();
+        for (BindingEventCandidate c : candidates) {
+            String kind = StringUtils.trimToEmpty(c.binding().getBindingKind());
             if (DeployedWebhookBindingStore.KIND_BOUNDARY_MESSAGE.equals(kind)) {
-                boundaries.add(b);
+                boundaries.add(c);
             } else if (DeployedWebhookBindingStore.KIND_SEND_AND_WAIT.equals(kind)
                     || DeployedWebhookBindingStore.KIND_MESSAGE_CATCH.equals(kind)) {
-                catches.add(b);
+                catches.add(c);
             } else if (DeployedWebhookBindingStore.KIND_MESSAGE_START.equals(kind)) {
-                starts.add(b);
+                starts.add(c);
             }
         }
 
-        String correlationKey = StringUtils.trimToNull(event.correlationKey());
-        Map<String, Object> payload = event.payload() == null ? Map.of() : event.payload();
-
         // Priority 1: Waiting BOUNDARY_MESSAGE bindings.
-        if (correlationKey != null && !boundaries.isEmpty()) {
+        if (!boundaries.isEmpty()) {
             int matchedBoundaries = 0;
-            for (DeployedWebhookBindingEntity b : boundaries) {
+            for (BindingEventCandidate c : boundaries) {
+                String correlationKey = StringUtils.trimToNull(c.event().correlationKey());
+                if (correlationKey == null) {
+                    continue;
+                }
+                Map<String, Object> payload = c.event().payload() == null ? Map.of() : c.event().payload();
+                DeployedWebhookBindingEntity b = c.binding();
                 WebhookEventOutcome out = safeCorrelate(new WebhookEventRequest(
                         SqEventType.BOUNDARY_MESSAGE,
                         b.getWorkflowId(),
@@ -320,9 +351,15 @@ public class IngestWebhookCommandHandler implements DaemonCommandHandler {
         }
 
         // Priority 2: Waiting SEND_AND_WAIT / MESSAGE_CATCH bindings.
-        if (correlationKey != null && !catches.isEmpty()) {
+        if (!catches.isEmpty()) {
             int matchedCatches = 0;
-            for (DeployedWebhookBindingEntity b : catches) {
+            for (BindingEventCandidate c : catches) {
+                String correlationKey = StringUtils.trimToNull(c.event().correlationKey());
+                if (correlationKey == null) {
+                    continue;
+                }
+                Map<String, Object> payload = c.event().payload() == null ? Map.of() : c.event().payload();
+                DeployedWebhookBindingEntity b = c.binding();
                 WebhookEventOutcome out = safeCorrelate(new WebhookEventRequest(
                         SqEventType.MESSAGE_CATCH,
                         b.getWorkflowId(),
@@ -341,7 +378,10 @@ public class IngestWebhookCommandHandler implements DaemonCommandHandler {
 
         // Priority 3: MESSAGE_START bindings (asynchronous dispatch so HTTP 200 returns fast).
         int dispatchedStarts = 0;
-        for (DeployedWebhookBindingEntity b : starts) {
+        for (BindingEventCandidate c : starts) {
+            String correlationKey = StringUtils.trimToNull(c.event().correlationKey());
+            Map<String, Object> payload = c.event().payload() == null ? Map.of() : c.event().payload();
+            DeployedWebhookBindingEntity b = c.binding();
             WebhookEventRequest startReq = new WebhookEventRequest(
                     SqEventType.MESSAGE_START,
                     b.getWorkflowId(),
