@@ -882,13 +882,19 @@ public class MessageCorrelationService {
         }
 
 
-        if (!refOnlyVars.isEmpty()) {
-            sqsEngine.setProcessVariables(processInstanceId, refOnlyVars);
+        // Preserve an existing graph-hydrated studioquackRef on the running process instance:
+        // sealMsg wrote the sealed payload rows under sealBusinessKey targeting targetNodeId
+        // (readable via loadInputsTargetingNode), whereas its synthetic snapshot has nodes=null.
+        // Overwriting an existing studioquackRef would break downstream script/sandbox dispatch.
+        Object existingRef = sqsEngine.getProcessVariable(processInstanceId, EngineVariableNames.STUDIOQUACK_REF);
+        Map<String, Object> varsToPin = existingRef == null ? refOnlyVars : Map.of();
+        if (!varsToPin.isEmpty()) {
+            sqsEngine.setProcessVariables(processInstanceId, varsToPin);
         }
         if (signal) {
-            sqsEngine.signalEventReceived(req.name(), executionId, refOnlyVars);
+            sqsEngine.signalEventReceived(req.name(), executionId, varsToPin);
         } else {
-            sqsEngine.messageEventReceived(req.name(), executionId, refOnlyVars);
+            sqsEngine.messageEventReceived(req.name(), executionId, varsToPin);
         }
         log.info("webhook.{}.done name={} businessKey={} executionId={} processInstanceId={}",
                 signal ? "signal-catch" : "message-catch", req.name(), businessKey, executionId, processInstanceId);
