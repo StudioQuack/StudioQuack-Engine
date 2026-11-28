@@ -6,8 +6,12 @@ import com.studioquack.common.dto.webhook.WebhookKeyRefHelper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import jakarta.annotation.PostConstruct;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -37,6 +41,25 @@ public class DaemonWebhookKeyStore {
     private static final int MAX_KEY_ID_ATTEMPTS = 8;
 
     private final DaemonWebhookKeyRepository repository;
+
+    @Autowired(required = false)
+    private JdbcTemplate jdbcTemplate;
+
+    /**
+     * Drops the retired NOT NULL legacy column from pre-upgrade H2/Postgres daemon schemas
+     * so inserts never fail with 23502 after Hibernate ddl-auto=update removes the entity field.
+     */
+    @PostConstruct
+    void dropRetiredColumns() {
+        if (jdbcTemplate == null) {
+            return;
+        }
+        try {
+            jdbcTemplate.execute("ALTER TABLE daemon_webhook_keys DROP COLUMN IF EXISTS allow_key_id_route");
+        } catch (RuntimeException ignored) {
+            // Table may not exist yet or column already removed.
+        }
+    }
 
     /** One-time key material returned immediately to the sealed control-plane response. */
     public record CreatedKey(String refId, String keyId, String rawKey) {
